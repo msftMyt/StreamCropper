@@ -499,60 +499,57 @@
     return n % 2 === 0 ? n : n - 1;
   }
 
-  function normalizeRegion(region) {
-    const w = clamp(Number(region && region.w) || 1, MIN_CROP_FRACTION, 1);
-    const h = clamp(Number(region && region.h) || 1, MIN_CROP_FRACTION, 1);
-    const x = clamp(Number(region && region.x) || 0, 0, 1 - w);
-    const y = clamp(Number(region && region.y) || 0, 0, 1 - h);
-    return { x, y, w, h };
+  function normalizeRegion({ x = 0, y = 0, w = 1, h = 1 } = {}) {
+    const width = clamp(Number(w) || 1, MIN_CROP_FRACTION, 1);
+    const height = clamp(Number(h) || 1, MIN_CROP_FRACTION, 1);
+    return {
+      x: clamp(Number(x) || 0, 0, 1 - width),
+      y: clamp(Number(y) || 0, 0, 1 - height),
+      w: width,
+      h: height
+    };
   }
 
   function isFullRegion(region) {
-    if (!region) return true;
-    return (
-      region.x <= 0.002 &&
-      region.y <= 0.002 &&
-      region.w >= 0.996 &&
-      region.h >= 0.996
-    );
+    return !region || (region.x <= 0.002 && region.y <= 0.002 && region.w >= 0.996 && region.h >= 0.996);
   }
 
   // Chromium's VideoFrame visibleRect requires even X/Y/width/height when the
   // underlying WebRTC decoder outputs 4:2:0 (I420 / NV12) planes; odd offsets
-  // throw a DOMException on sub-sampled chroma planes.
-  function computePixelCropRect(region, frameWidth, frameHeight) {
+  // throw a DOMException on sub-sampled chroma planes. `originX`/`originY`
+  // account for hardware decoders whose `visibleRect` starts at a non-zero offset.
+  function computePixelCropRect(region, frameWidth, frameHeight, originX = 0, originY = 0) {
     const norm = normalizeRegion(region);
     const fw = Math.max(4, Math.floor(Number(frameWidth) || 1920));
     const fh = Math.max(4, Math.floor(Number(frameHeight) || 1080));
+    const ox = Math.max(0, Math.floor(Number(originX) || 0));
+    const oy = Math.max(0, Math.floor(Number(originY) || 0));
 
-    const maxEvenW = fw % 2 === 0 ? fw : fw - 1;
-    const maxEvenH = fh % 2 === 0 ? fh : fh - 1;
+    const maxEvenW = fw - (fw % 2);
+    const maxEvenH = fh - (fh % 2);
 
     const width = clamp(roundDownEven(norm.w * fw, 16), 2, maxEvenW);
     const height = clamp(roundDownEven(norm.h * fh, 16), 2, maxEvenH);
 
-    let x = Math.round(norm.x * fw);
-    let y = Math.round(norm.y * fh);
+    let x = ox + Math.round(norm.x * fw);
+    let y = oy + Math.round(norm.y * fh);
     if (x % 2 !== 0) x -= 1;
     if (y % 2 !== 0) y -= 1;
 
-    x = clamp(x, 0, fw - width);
-    y = clamp(y, 0, fh - height);
-    if (x % 2 !== 0) x = Math.max(0, x - 1);
-    if (y % 2 !== 0) y = Math.max(0, y - 1);
+    x = clamp(x, ox, ox + fw - width);
+    y = clamp(y, oy, oy + fh - height);
+    if (x % 2 !== 0) x = Math.max(ox, x - 1);
+    if (y % 2 !== 0) y = Math.max(oy, y - 1);
 
     return { x, y, width, height };
   }
 
-  // Calculate normalized [0..1] crop regions for the quick-select buttons.
-  // On a 32:9 display (5120x1440), Left / Center / Right carve out an exact
-  // 16:9 slice (2560x1440). On a standard 16:9 stream, they grab half the width.
+  // On ultrawide streams (e.g. 5120x1440), Left / Center / Right carve out an exact
+  // 16:9 slice (2560x1440); on standard 16:9 streams, they grab half the width.
   function computeSourcePreset(presetId, streamAspect, defaultSliceAspect = "16:9") {
-    if (presetId === "full") {
-      return { ...FULL_REGION };
-    }
+    if (presetId === "full") return { ...FULL_REGION };
 
-    const sliceAspect = ASPECT_RATIOS[defaultSliceAspect] || 16 / 9;
+    const sliceAspect = ASPECT_RATIOS[defaultSliceAspect] ?? 16 / 9;
 
     if (presetId === "16:9" || presetId === "21:9") {
       const target = ASPECT_RATIOS[presetId];
@@ -567,36 +564,35 @@
       return { ...FULL_REGION };
     }
 
-    const w =
-      streamAspect > sliceAspect * 1.08
-        ? clamp(sliceAspect / streamAspect, MIN_CROP_FRACTION, 0.9)
-        : 0.5;
-    const h = 1;
+    const w = streamAspect > sliceAspect * 1.08
+      ? clamp(sliceAspect / streamAspect, MIN_CROP_FRACTION, 0.9)
+      : 0.5;
 
-    if (presetId === "left") return normalizeRegion({ x: 0, y: 0, w, h });
-    if (presetId === "center") return normalizeRegion({ x: (1 - w) / 2, y: 0, w, h });
-    if (presetId === "right") return normalizeRegion({ x: 1 - w, y: 0, w, h });
+    if (presetId === "left") return normalizeRegion({ x: 0, y: 0, w, h: 1 });
+    if (presetId === "center") return normalizeRegion({ x: (1 - w) / 2, y: 0, w, h: 1 });
+    if (presetId === "right") return normalizeRegion({ x: 1 - w, y: 0, w, h: 1 });
 
     return { ...FULL_REGION };
   }
 
   // Wraps a live WebRTC MediaStream and outputs a new MediaStream cropped to
   // `this.region`. Updating `this.region` mutates the crop on the fly for the
-  // next frame without needing to rebuild the stream or re-assign `srcObject`.
+  // next frame without rebuilding the stream or re-assigning `srcObject`.
   class MediaStreamCropSession {
-    constructor(sourceStream, initialRegion) {
+    #abort = null;
+    #generator = null;
+    #hiddenVideo = null;
+    #rafId = 0;
+    #onStreamReplaced;
+
+    constructor(sourceStream, initialRegion, { onStreamReplaced = null } = {}) {
       this.sourceStream = sourceStream;
       this.region = normalizeRegion(initialRegion);
       this.outputStream = null;
       this.mode = "none";
       this.disposed = false;
       this.lastOutputSize = { width: 0, height: 0 };
-
-      this._abortController = null;
-      this._generator = null;
-      this._hiddenVideo = null;
-      this._canvas = null;
-      this._rafId = null;
+      this.#onStreamReplaced = onStreamReplaced;
     }
 
     static supportsWebCodecs() {
@@ -609,76 +605,78 @@
 
     start() {
       if (this.disposed) return null;
-      const videoTracks = this.sourceStream.getVideoTracks ? this.sourceStream.getVideoTracks() : [];
-      if (!videoTracks.length) return this.sourceStream;
+      const [videoTrack] = this.sourceStream.getVideoTracks?.() ?? [];
+      if (!videoTrack) return this.sourceStream;
 
-      const videoTrack = videoTracks[0];
-      const audioTracks = this.sourceStream.getAudioTracks ? this.sourceStream.getAudioTracks() : [];
+      const audioTracks = this.sourceStream.getAudioTracks?.() ?? [];
 
-      // Electron / Chromium supports insertable streams + VideoFrame out of the box,
-      // which crops right on the GPU texture without a 2D canvas readback.
       if (MediaStreamCropSession.supportsWebCodecs()) {
         try {
-          return this._startWebCodecs(videoTrack, audioTracks);
-        } catch (_err) {
-          // Fall back to canvas captureStream if the track format isn't supported.
+          return this.startWebCodecs(videoTrack, audioTracks);
+        } catch (err) {
+          logWarn("WebCodecs crop startup failed; falling back to canvas stream.", err);
         }
       }
 
-      return this._startCanvasFallback(audioTracks);
+      return this.startCanvasFallback(audioTracks);
     }
 
     setRegion(nextRegion) {
       this.region = normalizeRegion(nextRegion);
     }
 
-    _startWebCodecs(videoTrack, audioTracks) {
+    startWebCodecs(videoTrack, audioTracks) {
       const processor = new MediaStreamTrackProcessor({ track: videoTrack });
       const generator = new MediaStreamTrackGenerator({ kind: "video" });
-      this._generator = generator;
-      this._abortController = typeof AbortController === "function" ? new AbortController() : null;
+      this.#generator = generator;
+      this.#abort = new AbortController();
 
-      const session = this;
       const transformer = new TransformStream({
-        transform(frame, controller) {
-          if (session.disposed) {
+        transform: (frame, controller) => {
+          if (this.disposed) {
             frame.close();
             return;
           }
           try {
-            const fw = frame.codedWidth || frame.displayWidth;
-            const fh = frame.codedHeight || frame.displayHeight;
-            const rect = computePixelCropRect(session.region, fw, fh);
-            session.lastOutputSize = { width: rect.width, height: rect.height };
+            const visible = frame.visibleRect;
+            const fw = visible?.width || frame.displayWidth || frame.codedWidth;
+            const fh = visible?.height || frame.displayHeight || frame.codedHeight;
+            const ox = visible?.x || 0;
+            const oy = visible?.y || 0;
 
-            const cropped = new VideoFrame(frame, {
-              visibleRect: rect,
-              timestamp: frame.timestamp,
-              duration: frame.duration ?? undefined
-            });
-            controller.enqueue(cropped);
-          } catch (_err) {
-            // Mid-stream WebRTC resolution shifts can briefly race our rect math;
-            // pass the uncropped frame through rather than dropping video.
+            const rect = computePixelCropRect(this.region, fw, fh, ox, oy);
+            this.lastOutputSize = { width: rect.width, height: rect.height };
+
+            controller.enqueue(
+              new VideoFrame(frame, {
+                visibleRect: rect,
+                timestamp: frame.timestamp,
+                duration: frame.duration ?? undefined
+              })
+            );
+          } catch {
+            // Mid-stream WebRTC resolution shifts can briefly race rect bounds;
+            // pass the uncropped frame through so video never freezes.
             try {
               controller.enqueue(new VideoFrame(frame));
-            } catch (_ignore) {
-              // Frame was already closed or invalid.
-            }
+            } catch {}
           } finally {
-            // Always close the source VideoFrame immediately or Chromium will
-            // stall the WebRTC decoder pool after ~16 leaked frames.
+            // Unclosed VideoFrames stall Chromium's WebRTC decoder pool after ~16 frames.
             frame.close();
           }
         }
       });
 
-      const pipeOpts = this._abortController ? { signal: this._abortController.signal } : undefined;
+      const { signal } = this.#abort;
       processor.readable
-        .pipeThrough(transformer, pipeOpts)
-        .pipeTo(generator.writable, pipeOpts)
-        .catch(() => {
-          // Stream ended or aborted during reset/teardown.
+        .pipeThrough(transformer, { signal })
+        .pipeTo(generator.writable, { signal })
+        .catch((err) => {
+          if (this.disposed || signal.aborted || videoTrack.readyState === "ended") return;
+          logWarn("WebCodecs crop stream failed asynchronously; switching to canvas fallback.", err);
+          this.#teardownWebCodecsOnly();
+          const fallback = this.startCanvasFallback(audioTracks);
+          this.#onStreamReplaced?.(fallback);
         });
 
       this.outputStream = new MediaStream([generator, ...audioTracks]);
@@ -687,22 +685,19 @@
       return this.outputStream;
     }
 
-    _startCanvasFallback(audioTracks) {
+    startCanvasFallback(audioTracks) {
       const hiddenVideo = document.createElement("video");
       hiddenVideo.dataset.dscInternal = "true";
       hiddenVideo.muted = true;
       hiddenVideo.autoplay = true;
       hiddenVideo.playsInline = true;
       hiddenVideo.srcObject = this.sourceStream;
-      if (typeof hiddenVideo.play === "function") {
-        const p = hiddenVideo.play();
-        if (p && typeof p.catch === "function") p.catch(() => {});
-      }
+      hiddenVideo.play()?.catch(() => {});
 
       const canvas = document.createElement("canvas");
       canvas.width = 1280;
       canvas.height = 720;
-      const ctx = canvas.getContext && canvas.getContext("2d", { alpha: false });
+      const ctx = canvas.getContext("2d", { alpha: false });
 
       const drawTick = () => {
         if (this.disposed) return;
@@ -717,70 +712,64 @@
           this.lastOutputSize = { width: rect.width, height: rect.height };
           try {
             ctx.drawImage(hiddenVideo, rect.x, rect.y, rect.width, rect.height, 0, 0, rect.width, rect.height);
-          } catch (_err) {
-            // Source video hasn't decoded a frame yet.
+          } catch {
+            // Frame not yet decoded on `hiddenVideo`.
           }
         }
-        if (typeof requestAnimationFrame === "function") {
-          this._rafId = requestAnimationFrame(drawTick);
-        }
+        this.#rafId = requestAnimationFrame(drawTick);
       };
 
       drawTick();
 
-      const stream = canvas.captureStream ? canvas.captureStream(60) : new MediaStream();
+      const stream = canvas.captureStream(60);
       for (const audioTrack of audioTracks) {
-        if (stream.addTrack) stream.addTrack(audioTrack);
+        stream.addTrack(audioTrack);
       }
       CROPPED_STREAMS.add(stream);
 
-      this._hiddenVideo = hiddenVideo;
-      this._canvas = canvas;
+      this.#hiddenVideo = hiddenVideo;
       this.outputStream = stream;
       this.mode = "canvas";
       return this.outputStream;
+    }
+
+    #teardownWebCodecsOnly() {
+      try {
+        this.#abort?.abort();
+      } catch {}
+      this.#abort = null;
+
+      try {
+        this.#generator?.stop?.();
+      } catch {}
+      this.#generator = null;
     }
 
     stop() {
       if (this.disposed) return;
       this.disposed = true;
 
-      if (this._abortController) {
-        try {
-          this._abortController.abort();
-        } catch (_e) {}
-        this._abortController = null;
+      this.#teardownWebCodecsOnly();
+
+      if (this.#rafId) {
+        cancelAnimationFrame(this.#rafId);
+        this.#rafId = 0;
       }
 
-      if (this._generator) {
-        try {
-          if (typeof this._generator.stop === "function") this._generator.stop();
-        } catch (_e) {}
-        this._generator = null;
+      if (this.#hiddenVideo) {
+        this.#hiddenVideo.pause();
+        this.#hiddenVideo.srcObject = null;
+        this.#hiddenVideo = null;
       }
 
-      if (this._rafId && typeof cancelAnimationFrame === "function") {
-        cancelAnimationFrame(this._rafId);
-        this._rafId = null;
-      }
-
-      if (this._hiddenVideo) {
-        try {
-          if (typeof this._hiddenVideo.pause === "function") this._hiddenVideo.pause();
-          this._hiddenVideo.srcObject = null;
-        } catch (_e) {}
-        this._hiddenVideo = null;
-      }
-
-      // Only stop our synthetic canvas video tracks — stopping shared audio tracks
-      // would mute the streamer's audio on Discord's original stream too.
-      if (this.outputStream && this.mode === "canvas" && this.outputStream.getVideoTracks) {
-        for (const track of this.outputStream.getVideoTracks()) {
-          if (typeof track.stop === "function") track.stop();
+      // Only stop synthetic canvas video tracks — stopping shared audio tracks
+      // would mute the streamer on Discord's original stream too.
+      if (this.mode === "canvas") {
+        for (const track of this.outputStream?.getVideoTracks?.() ?? []) {
+          track.stop?.();
         }
       }
 
-      this._canvas = null;
       this.outputStream = null;
     }
   }
@@ -1725,30 +1714,33 @@
       if (!this.originalStream || isFullRegion(this.region)) return;
 
       this._ensureSourceMonitor();
-      const session = new MediaStreamCropSession(this.originalStream, this.region);
+      const session = new MediaStreamCropSession(this.originalStream, this.region, {
+        onStreamReplaced: (fallbackStream) => {
+          if (this.cropSession !== session || !this.video.isConnected) return;
+          this._setNativeSrcObject(fallbackStream);
+          this.video.play()?.catch(() => {});
+        }
+      });
       const croppedStream = session.start();
       if (!croppedStream) return;
 
       this.cropSession = session;
       this._setNativeSrcObject(croppedStream);
-      if (typeof this.video.play === "function") {
-        const p = this.video.play();
-        if (p && typeof p.catch === "function") p.catch(() => {});
-      }
+      this.video.play()?.catch(() => {});
     }
 
     _teardownCropSession(restoreOriginal) {
-      const hadSession = Boolean(this.cropSession);
+      const hadSession = !!this.cropSession;
       if (this.cropSession) {
         this.cropSession.stop();
         this.cropSession = null;
       }
+      if (!this.isOpen && !this.isDrawing) {
+        this._destroySourceMonitor();
+      }
       if (restoreOriginal && hadSession && this.originalStream && this.video.isConnected) {
         this._setNativeSrcObject(this.originalStream);
-        if (typeof this.video.play === "function") {
-          const p = this.video.play();
-          if (p && typeof p.catch === "function") p.catch(() => {});
-        }
+        this.video.play()?.catch(() => {});
       }
     }
 
