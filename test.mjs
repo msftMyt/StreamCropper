@@ -349,12 +349,13 @@ function createMockDOM({ withWebCodecs = true } = {}) {
       this.track = track;
       this.readable = new ReadableStream({
         start(controller) {
-          track._pushFrame = (w, h, ts = 1000) => {
+          track._pushFrame = (w, h, ts = 1000, visibleRect = null) => {
             const rawFrame = {
               codedWidth: w,
               codedHeight: h,
-              displayWidth: w,
-              displayHeight: h,
+              displayWidth: visibleRect ? visibleRect.width : w,
+              displayHeight: visibleRect ? visibleRect.height : h,
+              visibleRect,
               timestamp: ts,
               closed: false,
               close() {
@@ -364,6 +365,7 @@ function createMockDOM({ withWebCodecs = true } = {}) {
             controller.enqueue(rawFrame);
             return rawFrame;
           };
+          track._failStream = (err) => controller.error(err);
         }
       });
     }
@@ -763,4 +765,83 @@ test("5. Auto-remember crop when clicking off a streamer and clicking back (both
 
   plugin.stop();
 });
+
+test("6. Async WebCodecs mid-stream error recovery, hardware visibleRect offset math, in-place region update & ARIA/keyboard controls", async () => {
+  const { env, PluginClass } = loadPlugin({ asBetterDiscord: true, withWebCodecs: true });
+  const { computePixelCropRect } = PluginClass;
+
+  // 1) Hardware-decoded VideoFrame with non-zero visibleRect padding offset (ox=16, oy=8)
+  const paddedRect = computePixelCropRect({ x: 0.25, y: 0, w: 0.5, h: 1 }, 5120, 1440, 16, 8);
+  assert.deepEqual({ ...paddedRect }, { x: 1296, y: 8, width: 2560, height: 1440 });
+
+  const plugin = new PluginClass();
+  plugin.start();
+
+  const videoTrack = {
+    id: "hw-track-1",
+    kind: "video",
+    readyState: "live",
+    getSettings: () => ({ width: 5120, height: 1440 })
+  };
+  const audioTrack = { id: "hw-audio-1", kind: "audio", stop() { this.stopped = true; } };
+  const rawStream = new env.MediaStream([videoTrack, audioTrack]);
+
+  const stage = env.document.createElement("div");
+  stage.style.position = "relative";
+  stage.clientWidth = 1600;
+  stage.clientHeight = 900;
+
+  const video = env.document.createElement("video");
+  video.srcObject = rawStream;
+  video.clientWidth = 1600;
+  video.clientHeight = 450;
+  video.videoWidth = 5120;
+  video.videoHeight = 1440;
+  stage.appendChild(video);
+  env.document.body.appendChild(stage);
+
+  plugin.scan();
+
+  const trigger = stage.querySelector(".dsc-trigger");
+  const hud = stage.querySelector(".dsc-hud");
+  const minimap = hud.querySelector(".dsc-minimap");
+
+  // 2) ARIA attributes update accurately on open / preset selection / close
+  assert.equal(trigger.getAttribute("aria-expanded"), "false");
+  trigger.dispatchEvent(env.makeEvent("click"));
+  assert.equal(trigger.getAttribute("aria-expanded"), "true");
+  assert.equal(hud.getAttribute("role"), "dialog");
+
+  const centerBtn = hud.querySelectorAll("button").find((b) => b.dataset.preset === "center");
+  centerBtn.dispatchEvent(env.makeEvent("click"));
+  assert.equal(centerBtn.getAttribute("aria-pressed"), "true");
+
+  const webCodecsStream = video.srcObject;
+  assert.equal(PluginClass.isCroppedStream(webCodecsStream), true);
+
+  // 3) Keyboard arrow nudging updates region IN-PLACE without reconstructing MediaStream
+  minimap.dispatchEvent(env.makeEvent("keydown", { key: "ArrowRight", shiftKey: true }));
+  assert.equal(video.srcObject, webCodecsStream, "MediaStream updated in-place without reconstruction");
+  assert.equal(centerBtn.getAttribute("aria-pressed"), "false");
+
+  // 4) Saved preset renders sibling buttons (apply + delete) rather than invalid nested buttons
+  const saveBtn = hud.querySelector(".dsc-save-btn");
+  saveBtn.dispatchEvent(env.makeEvent("click"));
+  const savedPill = hud.querySelector(".dsc-saved-pill");
+  assert.equal(savedPill.tagName, "DIV");
+  assert.equal(savedPill.querySelectorAll("button").length, 2, "Sibling apply and delete buttons");
+
+  // 5) Simulate asynchronous WebCodecs stream failure -> automatically swaps <video>.srcObject to canvas fallback!
+  videoTrack._failStream(new Error("GPU decoder context lost"));
+  await new Promise((r) => setTimeout(r, 30));
+
+  const recoveredStream = video.srcObject;
+  assert.notEqual(recoveredStream, webCodecsStream, "Replaced failed WebCodecs stream");
+  assert.equal(PluginClass.isCroppedStream(recoveredStream), true, "Switched seamlessly to canvas fallback stream");
+  assert.deepEqual(recoveredStream.getAudioTracks(), [audioTrack], "Preserved original audio track across fallback");
+
+  plugin.stop();
+  assert.equal(Boolean(audioTrack.stopped), false, "Original audio track never stopped on plugin teardown");
+});
+
 
