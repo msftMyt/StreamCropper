@@ -36,6 +36,11 @@
   // Ignore small voice-call avatar loops, nitro badges, and bottom bar preview tiles.
   const MIN_STAGE_VIDEO_WIDTH = 200;
   const MIN_STAGE_VIDEO_HEIGHT = 150;
+  const MIN_MINIPLAYER_WIDTH = 140;
+  const MIN_MINIPLAYER_HEIGHT = 80;
+  const COMPACT_HOST_WIDTH = 360;
+  const COMPACT_HOST_HEIGHT = 220;
+  const MODAL_ONLY_HOST_WIDTH = 340;
 
   // Minimum normalized selection size so WebCodecs never allocates zero-area frames.
   const MIN_CROP_FRACTION = 0.08;
@@ -168,6 +173,24 @@
 
     .dsc-trigger.dsc-is-cropped .dsc-dot {
       display: inline-block;
+    }
+
+    .dsc-root.dsc-compact .dsc-trigger {
+      top: 6px;
+      right: 6px;
+      height: 24px;
+      padding: 0 8px;
+      gap: 5px;
+      font-size: 11px;
+    }
+
+    .dsc-root.dsc-compact.dsc-pos-top-left .dsc-trigger {
+      right: auto;
+      left: 6px;
+    }
+
+    .dsc-root.dsc-compact .dsc-trigger-res {
+      display: none;
     }
 
     .dsc-hud {
@@ -577,6 +600,116 @@
     return doc?.body || doc?.documentElement || null;
   }
 
+  // Grab the streamer's display name from Discord's overlay badge without relying
+  // on hashed Discord class names that break on client updates.
+  function extractStreamerLabelFromNode(container, excludeRoot = null) {
+    if (!container) return "";
+    for (const el of container.querySelectorAll("span, div")) {
+      if (excludeRoot?.contains(el)) continue;
+      if (el.children.length > 0) continue;
+      const text = el.textContent?.trim() ?? "";
+      if (
+        text.length >= 2 &&
+        text.length <= 32 &&
+        !/^(LIVE|HD|FHD|QHD|4K|1080p|720p|1440p|60|30|FPS|\d+[:x×]\d+)$/i.test(text)
+      ) {
+        return text.toLowerCase();
+      }
+    }
+    return "";
+  }
+
+  function buildStreamIdentities(stream, dims, streamerLabel = "") {
+    const sessionKeys = [];
+    const persistentKeys = [];
+
+    if (stream) {
+      if (stream.id) sessionKeys.push(`stream:${stream.id}`);
+      const [vTrack] = stream.getVideoTracks?.() ?? [];
+      if (vTrack?.id) sessionKeys.push(`track:${vTrack.id}`);
+    }
+
+    const width = Number(dims?.width) || 0;
+    const height = Number(dims?.height) || 0;
+    const hasDims = width > 0 && height > 0;
+
+    if (streamerLabel && hasDims) persistentKeys.push(`streamer:${streamerLabel}|${width}x${height}`);
+    if (streamerLabel) persistentKeys.push(`streamer:${streamerLabel}`);
+    if (hasDims && width / Math.max(1, height) > 2.05) {
+      persistentKeys.push(`ultrawide-res:${width}x${height}`);
+    }
+
+    return { sessionKeys, persistentKeys };
+  }
+
+  function resolvePlayerHostForVideo(video, doc) {
+    const immediate = video?.parentElement;
+    if (!immediate) return null;
+
+    const fsEl = getActiveFullscreenElement(doc);
+    if (fsEl && fsEl !== video && fsEl.contains?.(video)) {
+      if (fsEl.querySelectorAll("video").length <= 1) {
+        return fsEl;
+      }
+    }
+
+    let best = immediate;
+    let cur = immediate;
+
+    for (let depth = 0; depth < 8 && cur && cur !== doc.body && cur !== doc.documentElement; depth++) {
+      if (cur.querySelectorAll("video").length > 1) break;
+
+      if (cur !== immediate && cur.children.length > 1) {
+        let hasParticipantRow = false;
+        for (const child of cur.children) {
+          if (child.contains(video)) continue;
+          const cr = child.getBoundingClientRect();
+          const cw = child.clientWidth || cr.width;
+          const ch = child.clientHeight || cr.height;
+          if (cw > 300 && ch >= 95) {
+            hasParticipantRow = true;
+            break;
+          }
+        }
+        if (hasParticipantRow) break;
+      }
+
+      const rect = cur.getBoundingClientRect();
+      const w = cur.clientWidth || rect.width;
+      const h = cur.clientHeight || rect.height;
+      if (w >= MIN_MINIPLAYER_WIDTH && h >= MIN_MINIPLAYER_HEIGHT) {
+        best = cur;
+      }
+
+      if (fsEl && cur === fsEl) break;
+      cur = cur.parentElement;
+    }
+
+    return best;
+  }
+
+  function isStandaloneMiniPlayerVideo(video, doc) {
+    const immediate = video?.parentElement;
+    if (!immediate || immediate.querySelectorAll("video").length > 1) return false;
+
+    let cur = immediate.parentElement;
+    for (let depth = 0; depth < 3 && cur && cur !== doc.body && cur !== doc.documentElement; depth++) {
+      if (cur.querySelectorAll("video").length > 1) {
+        const rect = cur.getBoundingClientRect();
+        const cw = cur.clientWidth || rect.width;
+        const ch = cur.clientHeight || rect.height;
+        // Multi-video participant tile grids sit inside a shared call grid box rather
+        // than the outer root app shell; exclude those avatar/camera tiles cleanly.
+        if (cw > 0 && ch > 0 && (cw < 1000 || ch < 650)) {
+          return false;
+        }
+        break;
+      }
+      cur = cur.parentElement;
+    }
+
+    return true;
+  }
   // Chromium's VideoFrame visibleRect requires even X/Y/width/height when the
   // underlying WebRTC decoder outputs 4:2:0 (I420 / NV12) planes; odd offsets
   // throw a DOMException on sub-sampled chroma planes. `originX`/`originY`
@@ -1355,6 +1488,47 @@
       }, 120);
     }
 
+    getCandidateIdentities(video) {
+      const doc = video?.ownerDocument || document;
+      const stream = video?.srcObject ?? null;
+      const [vTrack] = stream?.getVideoTracks?.() ?? [];
+      const settings = vTrack?.getSettings?.();
+      const width = settings?.width || video?.videoWidth || 0;
+      const height = settings?.height || video?.videoHeight || 0;
+      const host = resolvePlayerHostForVideo(video, doc);
+      const streamer = extractStreamerLabelFromNode(host);
+      return {
+        identities: buildStreamIdentities(stream, { width, height }, streamer),
+        width,
+        height
+      };
+    }
+
+    isRetainedControllerValid(video, controller) {
+      if (!video || video.nodeName !== "VIDEO" || !video.isConnected) return false;
+      if (video.dataset.dscInternal === "true") return false;
+      const doc = video.ownerDocument || document;
+      const win = doc.defaultView || window;
+      if (doc !== document && win?.closed) return false;
+      if (!isMediaStream(video.srcObject, win)) return false;
+
+      // Never drop an active crop — even if layout dimensions hit 0 during OS PiP or route transitions.
+      if (!isFullRegion(controller.region)) return true;
+
+      const rect = video.getBoundingClientRect();
+      const width = video.clientWidth || rect.width;
+      const height = video.clientHeight || rect.height;
+
+      if (width > MIN_STAGE_VIDEO_WIDTH && height > MIN_STAGE_VIDEO_HEIGHT) return true;
+
+      if (width >= MIN_MINIPLAYER_WIDTH && height >= MIN_MINIPLAYER_HEIGHT) {
+        const recalled = this.recallStreamCrop(controller.getStreamIdentities());
+        if (recalled && !isFullRegion(recalled.region)) return true;
+      }
+
+      return false;
+    }
+
     isEligibleStreamVideo(video) {
       if (!video || video.nodeName !== "VIDEO" || !video.isConnected) return false;
       if (video.dataset.dscInternal === "true") return false;
@@ -1367,7 +1541,19 @@
       const width = video.clientWidth || rect.width;
       const height = video.clientHeight || rect.height;
 
-      return width > MIN_STAGE_VIDEO_WIDTH && height > MIN_STAGE_VIDEO_HEIGHT;
+      if (width > MIN_STAGE_VIDEO_WIDTH && height > MIN_STAGE_VIDEO_HEIGHT) return true;
+
+      if (width >= MIN_MINIPLAYER_WIDTH && height >= MIN_MINIPLAYER_HEIGHT && isStandaloneMiniPlayerVideo(video, doc)) {
+        const { identities, width: srcW, height: srcH } = this.getCandidateIdentities(video);
+        const recalled = this.recallStreamCrop(identities);
+        if (recalled && !isFullRegion(recalled.region)) return true;
+
+        if (this.settings.autoCenterUltrawide) {
+          return srcW === 0 || srcW / Math.max(1, srcH) > 2.15;
+        }
+      }
+
+      return false;
     }
 
     scan() {
@@ -1389,7 +1575,7 @@
       }
 
       for (const [video, controller] of this.controllers) {
-        if (!activeDocSet.has(controller.doc) || !video.isConnected || !this.isEligibleStreamVideo(video)) {
+        if (!activeDocSet.has(controller.doc) || !video.isConnected || !this.isRetainedControllerValid(video, controller)) {
           controller.destroy();
           this.controllers.delete(video);
         } else {
@@ -1915,6 +2101,16 @@
       bar.className = "dsc-draw-modal-bar";
       bar.innerHTML = `<span>Drag across the part of the ${dims.width}×${dims.height} stream you want to watch</span>`;
 
+      if (!isFullRegion(ctrl.region)) {
+        const modalResetBtn = doc.createElement("button");
+        modalResetBtn.type = "button";
+        modalResetBtn.className = "dsc-icon-btn dsc-modal-reset-btn";
+        modalResetBtn.title = "Restore uncropped stream";
+        modalResetBtn.innerHTML = `${ICONS.reset}<span>Reset to Full Stream</span>`;
+        modalResetBtn.addEventListener("click", () => ctrl.reset(), { signal });
+        bar.appendChild(modalResetBtn);
+      }
+
       const cancelBtn = doc.createElement("button");
       cancelBtn.type = "button";
       cancelBtn.className = "dsc-icon-btn";
@@ -2082,8 +2278,15 @@
     }
 
     toggleHud() {
-      if (this.isOpen) this.closeHud();
-      else this.openHud();
+      if (this.isOpen) {
+        this.closeHud();
+        return;
+      }
+      if (this.#controller.shouldPreferDrawModal()) {
+        this.openDrawModal();
+        return;
+      }
+      this.openHud();
     }
 
     openHud() {
@@ -2117,6 +2320,12 @@
       if (!this.rootEl) return;
       const ctrl = this.#controller;
       const settings = ctrl.manager.settings;
+
+      const compact = ctrl.isCompactHost();
+      this.rootEl.classList.toggle("dsc-compact", compact);
+      if (compact && this.isOpen && ctrl.shouldPreferDrawModal()) {
+        this.closeHud();
+      }
 
       this.rootEl.classList.toggle("dsc-pos-top-left", settings.buttonPosition === "top-left");
 
@@ -2215,6 +2424,7 @@
   class VideoSourceController {
     #listeners = new AbortController();
     #hostListeners = null;
+    #hostResizeObserver = null;
     #nativeSrcDesc = null;
     #offRemoved = null;
     #hoverTimer = null;
@@ -2271,53 +2481,31 @@
       this.overlay.renderSavedPresets();
     }
 
+    getHostDimensions() {
+      const target = this.host || this.video;
+      if (!target) return { width: 0, height: 0 };
+      const rect = target.getBoundingClientRect();
+      return {
+        width: target.clientWidth || rect.width || 0,
+        height: target.clientHeight || rect.height || 0
+      };
+    }
+
+    isCompactHost() {
+      const { width, height } = this.getHostDimensions();
+      return (width > 0 && width < COMPACT_HOST_WIDTH) || (height > 0 && height < COMPACT_HOST_HEIGHT);
+    }
+
+    shouldPreferDrawModal() {
+      const { width, height } = this.getHostDimensions();
+      return (width > 0 && width < MODAL_ONLY_HOST_WIDTH) || (height > 0 && height < COMPACT_HOST_HEIGHT);
+    }
+
     // Climb out of the inner `<video>` flex box so the `Crop` button sits in the
     // top corner of the full stream stage, but stop before climbing into the outer
     // call container that also wraps the participant avatar row at the bottom.
     resolveHostContainer() {
-      const immediate = this.video.parentElement;
-      if (!immediate) return null;
-
-      const fsEl = getActiveFullscreenElement(this.doc);
-      if (fsEl && fsEl !== this.video && fsEl.contains?.(this.video)) {
-        if (fsEl.querySelectorAll("video").length <= 1) {
-          return fsEl;
-        }
-      }
-
-      let best = immediate;
-      let cur = immediate;
-
-      for (let depth = 0; depth < 8 && cur && cur !== this.doc.body && cur !== this.doc.documentElement; depth++) {
-        if (cur.querySelectorAll("video").length > 1) break;
-
-        if (cur !== immediate && cur.children.length > 1) {
-          let hasParticipantRow = false;
-          for (const child of cur.children) {
-            if (child.contains(this.video)) continue;
-            const cr = child.getBoundingClientRect();
-            const cw = child.clientWidth || cr.width;
-            const ch = child.clientHeight || cr.height;
-            if (cw > 300 && ch >= 95) {
-              hasParticipantRow = true;
-              break;
-            }
-          }
-          if (hasParticipantRow) break;
-        }
-
-        const rect = cur.getBoundingClientRect();
-        const w = cur.clientWidth || rect.width;
-        const h = cur.clientHeight || rect.height;
-        if (w >= MIN_STAGE_VIDEO_WIDTH && h >= MIN_STAGE_VIDEO_HEIGHT) {
-          best = cur;
-        }
-
-        if (fsEl && cur === fsEl) break;
-        cur = cur.parentElement;
-      }
-
-      return best;
+      return resolvePlayerHostForVideo(this.video, this.doc);
     }
 
     attachHost(nextHost) {
@@ -2325,6 +2513,8 @@
 
       this.#hostListeners?.abort();
       this.#hostListeners = null;
+      this.#hostResizeObserver?.disconnect?.();
+      this.#hostResizeObserver = null;
 
       if (this.host) {
         this.host.classList.remove("dsc-host-hover");
@@ -2353,6 +2543,14 @@
       nextHost.addEventListener("mouseenter", () => this.setHover(true), { signal: hostSignal });
       nextHost.addEventListener("mousemove", () => this.bumpHover(), { passive: true, signal: hostSignal });
       nextHost.addEventListener("mouseleave", () => this.setHover(false), { signal: hostSignal });
+
+      const ResizeObserverCtor = this.win?.ResizeObserver ?? (typeof ResizeObserver === "function" ? ResizeObserver : null);
+      if (ResizeObserverCtor) {
+        this.#hostResizeObserver = new ResizeObserverCtor(() => {
+          if (this.video.isConnected) this.syncUI();
+        });
+        this.#hostResizeObserver.observe(nextHost);
+      }
     }
 
     recheckHostContainer() {
@@ -2380,6 +2578,7 @@
       const onFullscreenChange = () => this.recheckHostContainer();
       this.doc.addEventListener("fullscreenchange", onFullscreenChange, { signal });
       this.doc.addEventListener("webkitfullscreenchange", onFullscreenChange, { signal });
+      this.win?.addEventListener?.("resize", onFullscreenChange, { passive: true, signal });
       this.video.addEventListener("loadedmetadata", () => this.handleStreamMetadata(), { signal });
       this.video.addEventListener("resize", () => this.handleStreamMetadata(), { signal });
 
@@ -2494,6 +2693,7 @@
           this.host.appendChild(this.overlay.rootEl);
           this.watchOverlayRemoval();
         }
+        this.syncUI();
       }
 
       const current = this.getNativeSrcObject();
@@ -2522,6 +2722,8 @@
       clearTimeout(this.#hoverTimer);
       this.#hoverTimer = null;
 
+      this.#hostResizeObserver?.disconnect?.();
+      this.#hostResizeObserver = null;
       this.#hostListeners?.abort();
       this.#hostListeners = null;
       this.#listeners.abort();
@@ -2540,46 +2742,12 @@
       }
     }
 
-    // Grab the streamer's display name from Discord's overlay badge without relying
-    // on hashed Discord class names that break on client updates.
     extractStreamerLabel() {
-      if (!this.host) return "";
-      for (const el of this.host.querySelectorAll("span, div")) {
-        if (this.overlay.rootEl?.contains(el)) continue;
-        if (el.children.length > 0) continue;
-        const text = el.textContent?.trim() ?? "";
-        if (
-          text.length >= 2 &&
-          text.length <= 32 &&
-          !/^(LIVE|HD|FHD|QHD|4K|1080p|720p|1440p|60|30|FPS|\d+[:x×]\d+)$/i.test(text)
-        ) {
-          return text.toLowerCase();
-        }
-      }
-      return "";
+      return extractStreamerLabelFromNode(this.host, this.overlay.rootEl);
     }
 
     getStreamIdentities() {
-      const sessionKeys = [];
-      const persistentKeys = [];
-
-      if (this.originalStream) {
-        if (this.originalStream.id) sessionKeys.push(`stream:${this.originalStream.id}`);
-        const [vTrack] = this.originalStream.getVideoTracks?.() ?? [];
-        if (vTrack?.id) sessionKeys.push(`track:${vTrack.id}`);
-      }
-
-      const dims = this.getOriginalDimensions();
-      const hasDims = dims.width > 0 && dims.height > 0;
-      const streamer = this.extractStreamerLabel();
-
-      if (streamer && hasDims) persistentKeys.push(`streamer:${streamer}|${dims.width}x${dims.height}`);
-      if (streamer) persistentKeys.push(`streamer:${streamer}`);
-      if (hasDims && dims.width / Math.max(1, dims.height) > 2.05) {
-        persistentKeys.push(`ultrawide-res:${dims.width}x${dims.height}`);
-      }
-
-      return { sessionKeys, persistentKeys };
+      return buildStreamIdentities(this.originalStream, this.getOriginalDimensions(), this.extractStreamerLabel());
     }
 
     handleStreamMetadata() {

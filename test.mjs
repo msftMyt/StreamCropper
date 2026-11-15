@@ -1160,5 +1160,170 @@ test("8. Fullscreen Mode support: Top-Layer modal mounting, dynamic fullscreench
   plugin.stop();
 });
 
+test("9. Discord In-App Floating Mini-Player (PiP) & OS Picture-in-Picture crop retention, .dsc-compact UI & full-frame modal fallback", () => {
+  const { env, PluginClass } = loadPlugin({ asBetterDiscord: true, withWebCodecs: true });
+  const plugin = new PluginClass();
+  plugin.start();
+
+  const videoTrack = {
+    id: "pip-video-track",
+    kind: "video",
+    getSettings: () => ({ width: 5120, height: 1440 })
+  };
+  const audioTrack = { id: "pip-audio-track", kind: "audio" };
+  const rawStream = Object.assign(new env.MediaStream([videoTrack, audioTrack]), { id: "pip-stream-alpha" });
+
+  // 1) Start watching stream on 1600x900 stage, open HUD, and crop to "Center"
+  const stageHost = env.document.createElement("div");
+  stageHost.clientWidth = 1600;
+  stageHost.clientHeight = 900;
+
+  const video = env.document.createElement("video");
+  video.srcObject = rawStream;
+  video.clientWidth = 1600;
+  video.clientHeight = 450;
+  video.videoWidth = 5120;
+  video.videoHeight = 1440;
+  stageHost.appendChild(video);
+  env.document.body.appendChild(stageHost);
+
+  plugin.scan();
+
+  const controller = plugin.controllers.get(video);
+  assert.ok(controller, "Stage video controller mounted");
+  const rootEl = controller.overlay.rootEl;
+  assert.equal(rootEl.classList.contains("dsc-compact"), false, "Full stage is not compact");
+
+  const trigger = stageHost.querySelector(".dsc-trigger");
+  trigger.dispatchEvent(env.makeEvent("click"));
+  assert.equal(controller.isOpen, true, "HUD opened on full stage");
+
+  const centerBtn = stageHost.querySelectorAll("button").find((b) => b.dataset.preset === "center");
+  centerBtn.dispatchEvent(env.makeEvent("click"));
+
+  const croppedStream = video.srcObject;
+  const activeSession = controller.cropSession;
+  assert.equal(PluginClass.isCroppedStream(croppedStream), true, "Stream cropped on stage");
+  assert.equal(controller.isOpen, true, "HUD still open before switching to #general");
+
+  // 2) User navigates to `#general` text chat -> Discord shrinks the watched player into a 240x135 corner mini-player!
+  stageHost.clientWidth = 240;
+  stageHost.clientHeight = 135;
+  video.clientWidth = 240;
+  video.clientHeight = 135;
+
+  plugin.scan();
+
+  assert.equal(plugin.controllers.has(video), true, "Controller kept alive when shrunk to 240x135 mini-player");
+  assert.equal(video.srcObject, croppedStream, "Cropped MediaStream stayed active in 240x135 mini-player");
+  assert.equal(controller.cropSession, activeSession, "Crop session uninterrupted during shrink to mini-player");
+  assert.equal(activeSession.disposed, false, "Crop session not disposed");
+  assert.equal(rootEl.classList.contains("dsc-compact"), true, ".dsc-compact applied on 240x135 mini-player");
+  assert.equal(controller.isOpen, false, "Open 336px HUD auto-closed cleanly so it does not overflow 240x135 mini-player");
+  assert.equal(rootEl.classList.contains("dsc-open"), false, ".dsc-open class removed on auto-close");
+
+  // 3) OS Picture-in-Picture / layout transition momentarily reports 0x0 client dimensions -> active crop still retained!
+  stageHost.clientWidth = 0;
+  stageHost.clientHeight = 0;
+  video.clientWidth = 0;
+  video.clientHeight = 0;
+
+  plugin.scan();
+
+  assert.equal(plugin.controllers.has(video), true, "Active crop retained even when video dimensions hit 0x0 during OS PiP");
+  assert.equal(video.srcObject, croppedStream, "Cropped MediaStream preserved during 0x0 OS PiP state");
+
+  // Restore 240x135 mini-player dimensions
+  stageHost.clientWidth = 240;
+  stageHost.clientHeight = 135;
+  video.clientWidth = 240;
+  video.clientHeight = 135;
+  plugin.scan();
+
+  // 4) Clicking compact `Crop` pill in 240x135 mini-player opens full-frame Draw Custom Region modal directly (with Reset button!)
+  trigger.dispatchEvent(env.makeEvent("click"));
+  assert.equal(controller.isOpen, false, "Did not open overflowing 336px HUD inside 240x135 mini-player");
+  assert.equal(controller.isDrawing, true, "Clicking Crop in compact mini-player opened full-frame draw modal");
+
+  const modal = env.document.body.querySelector(".dsc-draw-modal");
+  assert.ok(modal, "Full-frame draw modal mounted in document.body");
+  const modalResetBtn = modal.querySelector(".dsc-modal-reset-btn");
+  assert.ok(modalResetBtn, "Draw modal includes 'Reset to Full Stream' button while stream is cropped");
+
+  // Close modal via Cancel to keep crop remembered for the remount test, then verify Reset works too!
+  env.window.dispatchEvent(env.makeEvent("keydown", { key: "Escape" }));
+  assert.equal(controller.isDrawing, false, "Escape closed draw modal");
+
+  // 5) Discord unmounts the stage `<video>` completely and mounts a fresh 240x135 floating mini-player `<video>` with the same stream ID!
+  stageHost.remove();
+  plugin.scan();
+  assert.equal(plugin.controllers.size, 0, "Unmounted stage video cleaned up");
+
+  // Also ensure multi-video participant camera grid tiles (e.g. two 220x124 tiles in a 460x260 grid) are NOT misdetected as floating mini-player
+  const callGrid = env.document.createElement("div");
+  callGrid.clientWidth = 460;
+  callGrid.clientHeight = 260;
+  const tileA = env.document.createElement("div");
+  tileA.clientWidth = 192;
+  tileA.clientHeight = 108;
+  const camVideoA = env.document.createElement("video");
+  camVideoA.srcObject = rawStream;
+  camVideoA.clientWidth = 192;
+  camVideoA.clientHeight = 108;
+  tileA.appendChild(camVideoA);
+  const tileB = env.document.createElement("div");
+  tileB.clientWidth = 192;
+  tileB.clientHeight = 108;
+  const camVideoB = env.document.createElement("video");
+  camVideoB.srcObject = new env.MediaStream([{ id: "cam-b", kind: "video" }]);
+  camVideoB.clientWidth = 192;
+  camVideoB.clientHeight = 108;
+  tileB.appendChild(camVideoB);
+  callGrid.append(tileA, tileB);
+  env.document.body.appendChild(callGrid);
+
+  // Mount the real standalone 240x135 floating mini-player with the same stream ID (`pip-stream-alpha`)
+  const miniPlayerHost = env.document.createElement("div");
+  miniPlayerHost.clientWidth = 240;
+  miniPlayerHost.clientHeight = 135;
+  const miniVideo = env.document.createElement("video");
+  const remountedStream = Object.assign(
+    new env.MediaStream([{ id: "pip-video-track-2", kind: "video", getSettings: () => ({ width: 5120, height: 1440 }) }, audioTrack]),
+    { id: "pip-stream-alpha" }
+  );
+  miniVideo.srcObject = remountedStream;
+  miniVideo.clientWidth = 240;
+  miniVideo.clientHeight = 135;
+  miniVideo.videoWidth = 5120;
+  miniVideo.videoHeight = 1440;
+  miniPlayerHost.appendChild(miniVideo);
+  env.document.body.appendChild(miniPlayerHost);
+
+  plugin.scan();
+
+  assert.equal(plugin.controllers.has(camVideoA), false, "Ignored multi-video participant grid tile");
+  assert.equal(plugin.controllers.has(miniVideo), true, "Mounted controller onto newly created 240x135 floating mini-player");
+
+  const miniController = plugin.controllers.get(miniVideo);
+  assert.equal(PluginClass.isCroppedStream(miniVideo.srcObject), true, "Auto-restored remembered Center crop onto newly mounted 240x135 mini-player");
+  assert.equal(miniController.activePreset, "center", "Recalled exact 'center' preset on mini-player");
+  assert.equal(miniController.overlay.rootEl.classList.contains("dsc-compact"), true, "Newly mounted mini-player starts in .dsc-compact mode");
+
+  // 6) Click compact Crop pill on newly mounted mini-player and click `Reset to Full Stream` inside the modal -> 1-click Reset!
+  const miniTrigger = miniPlayerHost.querySelector(".dsc-trigger");
+  miniTrigger.dispatchEvent(env.makeEvent("click"));
+  const miniModal = env.document.body.querySelector(".dsc-draw-modal");
+  assert.ok(miniModal, "Draw modal opened from newly mounted mini-player");
+  const resetFromModal = miniModal.querySelector(".dsc-modal-reset-btn");
+  assert.ok(resetFromModal, "Reset to Full Stream button rendered in modal");
+  resetFromModal.dispatchEvent(env.makeEvent("click"));
+
+  assert.equal(miniController.isDrawing, false, "Reset to Full Stream closed the draw modal");
+  assert.equal(miniVideo.srcObject, remountedStream, "1-click Reset from modal restored uncropped stream on mini-player");
+
+  plugin.stop();
+});
+
+
 
 
