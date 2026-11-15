@@ -2,45 +2,66 @@
  * @name StreamCropper
  * @author msftMyt
  * @version 1.0.0
- * @description Crops ultrawide and multi-monitor Discord screen shares at the MediaStream source level so Discord natively layouts, zooms, pops out, and fullscreens the cropped region.
+ * @description Crops ultrawide and multi-monitor screen shares at the MediaStream level so Discord treats the cropped area like a native video source.
  * @website https://github.com/msftMyt/StreamCropper
  * @source https://github.com/msftMyt/StreamCropper/blob/main/StreamCropper.plugin.js
  */
 
-/* eslint-disable no-undef */
+/*
+ * Why MediaStream cropping instead of CSS `clip-path` / `transform`?
+ *
+ * Discord's player reads `video.videoWidth` and `video.videoHeight` to compute
+ * flex aspect-ratio wrappers, letterbox bounds, popout dimensions, and its
+ * built-in zoom/pan controls. If someone shares a 32:9 ultrawide monitor
+ * (5120x1440) and you try to crop it purely with CSS on `<video>`, Discord
+ * still thinks the stream is 32:9 and clamps it inside a short horizontal
+ * wrapper box with black bars all around it.
+ *
+ * Instead, this plugin crops the live WebRTC video track itself (using
+ * Chromium's WebCodecs `MediaStreamTrackProcessor` + `VideoFrame` visibleRect,
+ * falling back to `canvas.captureStream`) and feeds the resulting MediaStream
+ * into `video.srcObject`. Discord sees a genuine 2560x1440 (or custom-sized)
+ * stream and handles stage layout, fullscreen, popout, and native zoom on its own.
+ */
+
 (function () {
   "use strict";
 
   const PLUGIN_NAME = "StreamCropper";
-  const PLUGIN_VERSION = "1.0.0";
   const STYLE_ID = "dsc-stream-cropper-styles";
-  const STORAGE_KEY = "dsc-stream-cropper-data-v4";
+  const STORAGE_KEY = "dsc-stream-cropper-data";
+
   const MAX_SAVED_PRESETS = 6;
   const MAX_REMEMBERED_STREAMS = 24;
-  const MIN_VIDEO_WIDTH = 200;
-  const MIN_VIDEO_HEIGHT = 150;
-  const MIN_CROP_FRAC = 0.08;
 
-  // Private WeakSet tracking cropped MediaStreams without mutating any built-in or prototype objects
+  // Ignore small voice-call avatar loops, nitro badges, and bottom bar preview tiles.
+  const MIN_STAGE_VIDEO_WIDTH = 200;
+  const MIN_STAGE_VIDEO_HEIGHT = 150;
+
+  // Don't let users drag a 1px sliver that breaks WebCodecs frame allocation.
+  const MIN_CROP_FRACTION = 0.08;
+
+  // Track streams we created without tacking custom properties onto MediaStream objects.
   const CROPPED_STREAMS = new WeakSet();
 
   const FULL_REGION = Object.freeze({ x: 0, y: 0, w: 1, h: 1 });
 
   const DEFAULT_SETTINGS = Object.freeze({
-    buttonPosition: "top-right", // 'top-right' | 'top-left'
+    buttonPosition: "top-right",
     rememberPerStreamer: true,
     autoCenterUltrawide: false,
-    defaultSliceAspect: "16:9", // '16:9' | '21:9' | '4:3'
+    defaultSliceAspect: "16:9",
     showResolutionBadge: true
   });
 
-  const ASPECT_VALUES = Object.freeze({
+  const ASPECT_RATIOS = Object.freeze({
     "16:9": 16 / 9,
     "21:9": 21 / 9,
     "4:3": 4 / 3,
     "1:1": 1
   });
 
+  // Inline SVGs so we don't depend on external icon URLs blocked by Discord's CSP.
   const ICONS = {
     crop: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/></svg>`,
     draw: `<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><rect x="7" y="7" width="10" height="10" rx="1"/></svg>`,
@@ -49,7 +70,7 @@
     bookmark: `<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/></svg>`
   };
 
-  const CSS_STYLES = `
+  const STYLES = `
     .dsc-host-positioned {
       position: relative !important;
     }
@@ -72,7 +93,6 @@
       box-sizing: border-box;
     }
 
-    /* Subtle native-style floating pill button */
     .dsc-trigger {
       position: absolute;
       top: 12px;
@@ -145,7 +165,6 @@
       display: inline-block;
     }
 
-    /* Clean Discord-native Source Crop HUD */
     .dsc-hud {
       position: absolute;
       top: 48px;
@@ -236,7 +255,6 @@
       color: #ffffff;
     }
 
-    /* Quick Ultrawide Monitor Slice Presets */
     .dsc-chips {
       display: grid;
       grid-template-columns: repeat(5, 1fr);
@@ -268,7 +286,6 @@
       color: #ffffff;
     }
 
-    /* Full-Source Minimap Preview + Blurple Selection Box */
     .dsc-minimap {
       position: relative;
       width: 100%;
@@ -328,7 +345,6 @@
       box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
     }
 
-    /* Footer Action Row */
     .dsc-footer {
       display: flex;
       align-items: center;
@@ -351,7 +367,6 @@
       color: #ffffff;
     }
 
-    /* Saved Presets Row */
     .dsc-saved-row {
       display: flex;
       align-items: center;
@@ -394,7 +409,6 @@
       color: #ff7b7f;
     }
 
-    /* Full-Source Interactive Draw Modal */
     .dsc-draw-modal {
       position: fixed;
       inset: 0;
@@ -469,7 +483,7 @@
       white-space: nowrap;
     }
 
-    /* BetterDiscord Settings Panel */
+    /* Fallback settings layout when running outside BdApi.UI.buildSettingsPanel */
     .dsc-settings-panel {
       padding: 12px 4px;
       color: #dbdee1;
@@ -525,47 +539,47 @@
     }
   `;
 
-  function clamp(val, min, max) {
-    if (!Number.isFinite(val)) return min;
-    return Math.min(max, Math.max(min, val));
+  function clamp(value, min, max) {
+    if (!Number.isFinite(value)) return min;
+    return Math.min(max, Math.max(min, value));
   }
 
-  function evenInt(n, minVal = 2) {
-    const rounded = Math.max(minVal, Math.round(n));
-    return rounded % 2 === 0 ? rounded : rounded - 1;
+  function roundDownEven(value, minEven = 2) {
+    const n = Math.max(minEven, Math.round(value));
+    return n % 2 === 0 ? n : n - 1;
   }
 
-  function normalizeRegion(reg) {
-    const w = clamp(Number(reg && reg.w) || 1, MIN_CROP_FRAC, 1);
-    const h = clamp(Number(reg && reg.h) || 1, MIN_CROP_FRAC, 1);
-    const x = clamp(Number(reg && reg.x) || 0, 0, 1 - w);
-    const y = clamp(Number(reg && reg.y) || 0, 0, 1 - h);
+  function normalizeRegion(region) {
+    const w = clamp(Number(region && region.w) || 1, MIN_CROP_FRACTION, 1);
+    const h = clamp(Number(region && region.h) || 1, MIN_CROP_FRACTION, 1);
+    const x = clamp(Number(region && region.x) || 0, 0, 1 - w);
+    const y = clamp(Number(region && region.y) || 0, 0, 1 - h);
     return { x, y, w, h };
   }
 
-  function isFullRegion(reg) {
+  function isFullRegion(region) {
+    if (!region) return true;
     return (
-      !reg ||
-      (reg.x <= 0.002 && reg.y <= 0.002 && reg.w >= 0.996 && reg.h >= 0.996)
+      region.x <= 0.002 &&
+      region.y <= 0.002 &&
+      region.w >= 0.996 &&
+      region.h >= 0.996
     );
   }
 
-  /**
-   * Convert normalized region `{ x, y, w, h }` and source frame dimensions `(frameW, frameH)`
-   * into an even-aligned WebCodecs / Canvas pixel crop rectangle `{ x, y, width, height }`
-   * guaranteed to fit strictly inside `[0, frameW] x [0, frameH]`.
-   * Even pixel alignment is required by Chromium I420/NV12 GPU `VideoFrame` sub-rectangles!
-   */
-  function computePixelCropRect(region, frameW, frameH) {
+  // Chromium's VideoFrame visibleRect requires even X/Y/width/height when the
+  // underlying WebRTC decoder outputs 4:2:0 (I420 / NV12) planes; odd offsets
+  // throw a DOMException on sub-sampled chroma planes.
+  function computePixelCropRect(region, frameWidth, frameHeight) {
     const norm = normalizeRegion(region);
-    const fw = Math.max(4, Math.floor(Number(frameW) || 1920));
-    const fh = Math.max(4, Math.floor(Number(frameH) || 1080));
+    const fw = Math.max(4, Math.floor(Number(frameWidth) || 1920));
+    const fh = Math.max(4, Math.floor(Number(frameHeight) || 1080));
 
     const maxEvenW = fw % 2 === 0 ? fw : fw - 1;
     const maxEvenH = fh % 2 === 0 ? fh : fh - 1;
 
-    const width = clamp(evenInt(norm.w * fw, 16), 2, maxEvenW);
-    const height = clamp(evenInt(norm.h * fh, 16), 2, maxEvenH);
+    const width = clamp(roundDownEven(norm.w * fw, 16), 2, maxEvenW);
+    const height = clamp(roundDownEven(norm.h * fh, 16), 2, maxEvenH);
 
     let x = Math.round(norm.x * fw);
     let y = Math.round(norm.y * fh);
@@ -580,67 +594,45 @@
     return { x, y, width, height };
   }
 
-  /**
-   * Compute clean preset slices (`left`, `center`, `right`, `16:9`, `21:9`) in normalized
-   * source coordinates `[0..1]`.
-   * On a 32:9 ultrawide (`5120x1440`), `left` / `center` / `right` extract a true `2560x1440` (16:9)
-   * monitor source so Discord lays it out identically to a standard 16:9 stream!
-   */
+  // Calculate normalized [0..1] crop regions for the quick-select buttons.
+  // On a 32:9 display (5120x1440), Left / Center / Right carve out an exact
+  // 16:9 slice (2560x1440). On a standard 16:9 stream, they grab half the width.
   function computeSourcePreset(presetId, streamAspect, defaultSliceAspect = "16:9") {
     if (presetId === "full") {
       return { ...FULL_REGION };
     }
 
-    const sliceRatio = ASPECT_VALUES[defaultSliceAspect] || 16 / 9;
+    const sliceAspect = ASPECT_RATIOS[defaultSliceAspect] || 16 / 9;
 
     if (presetId === "16:9" || presetId === "21:9") {
-      const target = ASPECT_VALUES[presetId];
+      const target = ASPECT_RATIOS[presetId];
       if (streamAspect > target * 1.01) {
-        const w = clamp(target / streamAspect, MIN_CROP_FRAC, 1);
+        const w = clamp(target / streamAspect, MIN_CROP_FRACTION, 1);
         return normalizeRegion({ x: (1 - w) / 2, y: 0, w, h: 1 });
       }
       if (streamAspect < target * 0.99) {
-        const h = clamp(streamAspect / target, MIN_CROP_FRAC, 1);
+        const h = clamp(streamAspect / target, MIN_CROP_FRACTION, 1);
         return normalizeRegion({ x: 0, y: (1 - h) / 2, w: 1, h });
       }
       return { ...FULL_REGION };
     }
 
-    // Left / Center / Right slices:
-    // For ultrawide streams wider than `sliceRatio` (e.g., 32:9 or 21:9 vs 16:9), slice an exact `sliceRatio` monitor!
-    // For standard 16:9 streams, slice a clean half-screen/focus region.
-    let w;
-    let h = 1;
-    if (streamAspect > sliceRatio * 1.08) {
-      w = clamp(sliceRatio / streamAspect, MIN_CROP_FRAC, 0.9);
-      h = 1;
-    } else {
-      w = 0.5;
-      h = 1;
-    }
+    const w =
+      streamAspect > sliceAspect * 1.08
+        ? clamp(sliceAspect / streamAspect, MIN_CROP_FRACTION, 0.9)
+        : 0.5;
+    const h = 1;
 
-    if (presetId === "left") {
-      return normalizeRegion({ x: 0, y: 0, w, h });
-    }
-    if (presetId === "center") {
-      return normalizeRegion({ x: (1 - w) / 2, y: 0, w, h });
-    }
-    if (presetId === "right") {
-      return normalizeRegion({ x: 1 - w, y: 0, w, h });
-    }
+    if (presetId === "left") return normalizeRegion({ x: 0, y: 0, w, h });
+    if (presetId === "center") return normalizeRegion({ x: (1 - w) / 2, y: 0, w, h });
+    if (presetId === "right") return normalizeRegion({ x: 1 - w, y: 0, w, h });
 
     return { ...FULL_REGION };
   }
 
-  /**
-   * Real-time MediaStream Crop Engine:
-   * - Primary path (Chromium / Electron WebCodecs):
-   *   `MediaStreamTrackProcessor` -> `new VideoFrame(frame, { visibleRect })` -> `MediaStreamTrackGenerator`
-   *   Zero-copy GPU sub-rectangle crop! Preserves original framerate, timestamps, and color space,
-   *   and emits a real `MediaStream` whose intrinsic `videoWidth x videoHeight` IS the cropped size.
-   * - Fallback path:
-   *   Hidden `<video>` + `<canvas>.captureStream(60)` for environments without insertable streams.
-   */
+  // Wraps a live WebRTC MediaStream and outputs a new MediaStream cropped to
+  // `this.region`. Updating `this.region` mutates the crop on the fly for the
+  // next frame without needing to rebuild the stream or re-assign `srcObject`.
   class MediaStreamCropSession {
     constructor(sourceStream, initialRegion) {
       this.sourceStream = sourceStream;
@@ -657,7 +649,7 @@
       this._rafId = null;
     }
 
-    static supportsWebCodecsCrop() {
+    static supportsWebCodecs() {
       return (
         typeof MediaStreamTrackProcessor === "function" &&
         typeof MediaStreamTrackGenerator === "function" &&
@@ -670,79 +662,84 @@
       const videoTracks = this.sourceStream.getVideoTracks ? this.sourceStream.getVideoTracks() : [];
       if (!videoTracks.length) return this.sourceStream;
 
-      const srcVideoTrack = videoTracks[0];
+      const videoTrack = videoTracks[0];
       const audioTracks = this.sourceStream.getAudioTracks ? this.sourceStream.getAudioTracks() : [];
 
-      if (MediaStreamCropSession.supportsWebCodecsCrop()) {
+      // Electron / Chromium supports insertable streams + VideoFrame out of the box,
+      // which crops right on the GPU texture without a 2D canvas readback.
+      if (MediaStreamCropSession.supportsWebCodecs()) {
         try {
-          return this._startWebCodecsPipeline(srcVideoTrack, audioTracks);
+          return this._startWebCodecs(videoTrack, audioTracks);
         } catch (_err) {
-          // Fall through to canvas captureStream pipeline if WebCodecs rejects track kind
+          // Fall back to canvas captureStream if the track format isn't supported.
         }
       }
 
-      return this._startCanvasPipeline(audioTracks);
+      return this._startCanvasFallback(audioTracks);
     }
 
     setRegion(nextRegion) {
       this.region = normalizeRegion(nextRegion);
     }
 
-    _startWebCodecsPipeline(srcVideoTrack, audioTracks) {
-      const processor = new MediaStreamTrackProcessor({ track: srcVideoTrack });
+    _startWebCodecs(videoTrack, audioTracks) {
+      const processor = new MediaStreamTrackProcessor({ track: videoTrack });
       const generator = new MediaStreamTrackGenerator({ kind: "video" });
       this._generator = generator;
       this._abortController = typeof AbortController === "function" ? new AbortController() : null;
 
-      const self = this;
+      const session = this;
       const transformer = new TransformStream({
         transform(frame, controller) {
-          if (self.disposed) {
+          if (session.disposed) {
             frame.close();
             return;
           }
           try {
             const fw = frame.codedWidth || frame.displayWidth;
             const fh = frame.codedHeight || frame.displayHeight;
-            const rect = computePixelCropRect(self.region, fw, fh);
-            self.lastOutputSize = { width: rect.width, height: rect.height };
+            const rect = computePixelCropRect(session.region, fw, fh);
+            session.lastOutputSize = { width: rect.width, height: rect.height };
 
-            const croppedFrame = new VideoFrame(frame, {
+            const cropped = new VideoFrame(frame, {
               visibleRect: rect,
               timestamp: frame.timestamp,
               duration: frame.duration ?? undefined
             });
-            controller.enqueue(croppedFrame);
+            controller.enqueue(cropped);
           } catch (_err) {
-            // If a mid-renegotiation frame has smaller bounds than rect, pass frame through safely
+            // Mid-stream WebRTC resolution shifts can briefly race our rect math;
+            // pass the uncropped frame through rather than dropping video.
             try {
               controller.enqueue(new VideoFrame(frame));
-            } catch (_inner) {
-              // Drop malformed frame safely
+            } catch (_ignore) {
+              // Frame was already closed or invalid.
             }
           } finally {
+            // Always close the source VideoFrame immediately or Chromium will
+            // stall the WebRTC decoder pool after ~16 leaked frames.
             frame.close();
           }
         }
       });
 
-      const pipeOptions = this._abortController ? { signal: this._abortController.signal } : undefined;
+      const pipeOpts = this._abortController ? { signal: this._abortController.signal } : undefined;
       processor.readable
-        .pipeThrough(transformer, pipeOptions)
-        .pipeTo(generator.writable, pipeOptions)
+        .pipeThrough(transformer, pipeOpts)
+        .pipeTo(generator.writable, pipeOpts)
         .catch(() => {
-          // Expected abort / stream end when user resets crop or streamer stops sharing
+          // Stream ended or aborted during reset/teardown.
         });
 
-      const composedTracks = [generator, ...audioTracks];
-      this.outputStream = new MediaStream(composedTracks);
+      this.outputStream = new MediaStream([generator, ...audioTracks]);
       CROPPED_STREAMS.add(this.outputStream);
       this.mode = "webcodecs";
       return this.outputStream;
     }
 
-    _startCanvasPipeline(audioTracks) {
+    _startCanvasFallback(audioTracks) {
       const hiddenVideo = document.createElement("video");
+      hiddenVideo.dataset.dscInternal = "true";
       hiddenVideo.muted = true;
       hiddenVideo.autoplay = true;
       hiddenVideo.playsInline = true;
@@ -757,7 +754,7 @@
       canvas.height = 720;
       const ctx = canvas.getContext && canvas.getContext("2d", { alpha: false });
 
-      const renderTick = () => {
+      const drawTick = () => {
         if (this.disposed) return;
         const vw = hiddenVideo.videoWidth;
         const vh = hiddenVideo.videoHeight;
@@ -769,37 +766,27 @@
           }
           this.lastOutputSize = { width: rect.width, height: rect.height };
           try {
-            ctx.drawImage(
-              hiddenVideo,
-              rect.x,
-              rect.y,
-              rect.width,
-              rect.height,
-              0,
-              0,
-              rect.width,
-              rect.height
-            );
+            ctx.drawImage(hiddenVideo, rect.x, rect.y, rect.width, rect.height, 0, 0, rect.width, rect.height);
           } catch (_err) {
-            // Ignore transient frame readiness errors
+            // Source video hasn't decoded a frame yet.
           }
         }
         if (typeof requestAnimationFrame === "function") {
-          this._rafId = requestAnimationFrame(renderTick);
+          this._rafId = requestAnimationFrame(drawTick);
         }
       };
 
-      renderTick();
+      drawTick();
 
-      const captured = canvas.captureStream ? canvas.captureStream(60) : new MediaStream();
-      for (const aTrack of audioTracks) {
-        if (captured.addTrack) captured.addTrack(aTrack);
+      const stream = canvas.captureStream ? canvas.captureStream(60) : new MediaStream();
+      for (const audioTrack of audioTracks) {
+        if (stream.addTrack) stream.addTrack(audioTrack);
       }
-      CROPPED_STREAMS.add(captured);
+      CROPPED_STREAMS.add(stream);
 
       this._hiddenVideo = hiddenVideo;
       this._canvas = canvas;
-      this.outputStream = captured;
+      this.outputStream = stream;
       this.mode = "canvas";
       return this.outputStream;
     }
@@ -811,18 +798,14 @@
       if (this._abortController) {
         try {
           this._abortController.abort();
-        } catch (_e) {
-          // Ignore abort error
-        }
+        } catch (_e) {}
         this._abortController = null;
       }
 
       if (this._generator) {
         try {
           if (typeof this._generator.stop === "function") this._generator.stop();
-        } catch (_e) {
-          // Ignore track stop error
-        }
+        } catch (_e) {}
         this._generator = null;
       }
 
@@ -835,16 +818,15 @@
         try {
           if (typeof this._hiddenVideo.pause === "function") this._hiddenVideo.pause();
           this._hiddenVideo.srcObject = null;
-        } catch (_e) {
-          // Ignore cleanup error
-        }
+        } catch (_e) {}
         this._hiddenVideo = null;
       }
 
+      // Only stop our synthetic canvas video tracks — stopping shared audio tracks
+      // would mute the streamer's audio on Discord's original stream too.
       if (this.outputStream && this.mode === "canvas" && this.outputStream.getVideoTracks) {
-        // Stop only synthetic canvas video tracks — NEVER stop shared original audio tracks!
-        for (const vt of this.outputStream.getVideoTracks()) {
-          if (typeof vt.stop === "function") vt.stop();
+        for (const track of this.outputStream.getVideoTracks()) {
+          if (typeof track.stop === "function") track.stop();
         }
       }
 
@@ -853,66 +835,31 @@
     }
   }
 
-  /**
-   * Event-driven `srcObject` coordinator (ZERO prototype modification — 100% BetterDiscord guideline compliant!).
-   * Uses `<video>`'s native `emptied` / `loadstart` / `loadedmetadata` events + scan checks to detect
-   * if Discord's React re-assigned `video.srcObject = rawStream` or switched to a new streamer,
-   * without touching `HTMLMediaElement.prototype` or any global variables.
-   */
-  class SrcObjectCoordinator {
-    setRawSrcObject(video, stream) {
-      video.srcObject = stream;
-    }
-
-    getRawSrcObject(video) {
-      return video.srcObject;
-    }
-
-    install() {}
-
-    uninstall() {}
-  }
-
-  class DiscordStreamCropper {
+  class StreamCropper {
     constructor(meta) {
       this.meta = meta || {};
+      // Scoped BdApi instance (`new BdApi("StreamCropper")`) when running inside BetterDiscord.
+      this.api = typeof BdApi === "function" ? new BdApi(this.meta.name || PLUGIN_NAME) : null;
+
       this._running = false;
       this._controllers = new Map();
-      this._interceptor = new SrcObjectCoordinator();
-      this._mutationObserver = null;
       this._scanTimer = null;
       this._rescanInterval = null;
 
-      const persisted = this._loadData();
-      this.settings = { ...DEFAULT_SETTINGS, ...(persisted.settings || {}) };
-      this.savedPresets = Array.isArray(persisted.presets)
-        ? persisted.presets.slice(0, MAX_SAVED_PRESETS)
+      const saved = this._loadData();
+      this.settings = Object.assign({}, DEFAULT_SETTINGS, saved.settings || {});
+      this.savedPresets = Array.isArray(saved.presets)
+        ? saved.presets.slice(0, MAX_SAVED_PRESETS)
         : [];
-      // Persistent memory of active crops keyed by streamer/resolution/stream identity
-      // so clicking off a stream and clicking right back restores your exact crop automatically!
-      this.rememberedCrops = Array.isArray(persisted.rememberedCrops)
-        ? persisted.rememberedCrops.slice(0, MAX_REMEMBERED_STREAMS)
+      this.rememberedCrops = Array.isArray(saved.rememberedCrops)
+        ? saved.rememberedCrops.slice(0, MAX_REMEMBERED_STREAMS)
         : [];
-      this._sessionStreamMemory = new Map(); // exact stream.id / track.id -> { region, preset }
+
+      // Fast in-memory map keyed by WebRTC stream/track IDs for the current voice session.
+      this._sessionMemory = new Map();
 
       this._onDocPointerDown = this._handleDocPointerDown.bind(this);
       this._onKeyDown = this._handleKeyDown.bind(this);
-    }
-
-    getName() {
-      return PLUGIN_NAME;
-    }
-
-    getDescription() {
-      return "Crops ultrawide and multi-monitor Discord screen shares at the MediaStream source level so Discord natively layouts, zooms, pops out, and fullscreens the cropped region.";
-    }
-
-    getVersion() {
-      return PLUGIN_VERSION;
-    }
-
-    getAuthor() {
-      return "msftMyt";
     }
 
     start() {
@@ -920,24 +867,34 @@
       this._running = true;
 
       this._injectStyles();
-      this._interceptor.install();
       this.scan();
-
-      if (typeof MutationObserver !== "undefined" && document.body) {
-        this._mutationObserver = new MutationObserver(() => this._scheduleScan());
-        this._mutationObserver.observe(document.body, {
-          childList: true,
-          subtree: true
-        });
-      }
 
       document.addEventListener("pointerdown", this._onDocPointerDown, true);
       document.addEventListener("mousedown", this._onDocPointerDown, true);
       window.addEventListener("keydown", this._onKeyDown, true);
 
+      // Lightweight check because Discord assigns `video.srcObject` asynchronously
+      // after mounting `<video>`, which doesn't fire a DOM attribute mutation.
       this._rescanInterval = setInterval(() => {
         if (this._running) this.scan();
-      }, 1200);
+      }, 1500);
+    }
+
+    // Native BetterDiscord lifecycle hook: BD already runs a single global MutationObserver
+    // and passes every document MutationRecord here, so we don't spin up a second observer.
+    observer(mutation) {
+      if (!this._running) return;
+      if (mutation && mutation.addedNodes && mutation.addedNodes.length > 0) {
+        this._scheduleScan();
+      } else if (mutation && mutation.removedNodes && mutation.removedNodes.length > 0) {
+        this._scheduleScan();
+      }
+    }
+
+    // Native BetterDiscord lifecycle hook: fired whenever the user switches channels/servers/views.
+    onSwitch() {
+      if (!this._running) return;
+      this._scheduleScan();
     }
 
     stop() {
@@ -951,10 +908,6 @@
         clearInterval(this._rescanInterval);
         this._rescanInterval = null;
       }
-      if (this._mutationObserver) {
-        this._mutationObserver.disconnect();
-        this._mutationObserver = null;
-      }
 
       document.removeEventListener("pointerdown", this._onDocPointerDown, true);
       document.removeEventListener("mousedown", this._onDocPointerDown, true);
@@ -964,17 +917,11 @@
         controller.destroy();
       }
       this._controllers.clear();
-      this._sessionStreamMemory.clear();
+      this._sessionMemory.clear();
 
-      this._interceptor.uninstall();
       this._removeStyles();
     }
 
-    /**
-     * Native BetterDiscord Settings Panel integration (`Plugins -> StreamCropper -> Settings` gear icon).
-     * Uses `BdApi.UI.buildSettingsPanel` when available for 100% native BetterDiscord controls,
-     * with a clean DOM fallback for test/standalone environments.
-     */
     getSettingsPanel() {
       if (typeof BdApi !== "undefined" && BdApi.UI && typeof BdApi.UI.buildSettingsPanel === "function") {
         return BdApi.UI.buildSettingsPanel({
@@ -983,7 +930,7 @@
               type: "dropdown",
               id: "buttonPosition",
               name: "Overlay Button Position",
-              note: "Corner of the stream player where the Crop button appears on hover.",
+              note: "Which corner of the stream player shows the Crop button on hover.",
               value: this.settings.buttonPosition,
               options: [
                 { label: "Top Right", value: "top-right" },
@@ -993,8 +940,8 @@
             {
               type: "dropdown",
               id: "defaultSliceAspect",
-              name: "Default Left / Center / Right Slice Ratio",
-              note: "Target monitor aspect ratio extracted when clicking Left, Center, or Right on an ultrawide stream.",
+              name: "Left / Center / Right Target Aspect Ratio",
+              note: "Aspect ratio carved out when clicking Left, Center, or Right on an ultrawide stream.",
               value: this.settings.defaultSliceAspect,
               options: [
                 { label: "16:9 Standard Monitor", value: "16:9" },
@@ -1005,22 +952,22 @@
             {
               type: "switch",
               id: "rememberPerStreamer",
-              name: "Auto-Remember Crop When Switching Streams",
-              note: "Automatically restores your last crop when you click off someone's stream and click back onto it.",
+              name: "Remember Crop Per Streamer",
+              note: "Restores your last crop automatically if you click off someone's stream and click back.",
               value: Boolean(this.settings.rememberPerStreamer)
             },
             {
               type: "switch",
               id: "autoCenterUltrawide",
               name: "Auto-Center Ultrawide Streams (21:9 / 32:9)",
-              note: "Automatically apply a Center crop whenever an ultrawide screen share starts.",
+              note: "Automatically start in Center crop whenever an ultrawide screen share opens.",
               value: Boolean(this.settings.autoCenterUltrawide)
             },
             {
               type: "switch",
               id: "showResolutionBadge",
-              name: "Show Active Resolution on Crop Pill",
-              note: "Displays the live cropped pixel resolution (e.g. 2560×1440) next to the Crop button when active.",
+              name: "Show Cropped Resolution on Pill",
+              note: "Shows the active output dimensions (e.g. 2560×1440) next to the Crop button.",
               value: Boolean(this.settings.showResolutionBadge)
             }
           ],
@@ -1032,14 +979,17 @@
         });
       }
 
+      return this._buildFallbackSettingsPanel();
+    }
+
+    _buildFallbackSettingsPanel() {
       const panel = document.createElement("div");
       panel.className = "dsc-settings-panel";
 
-      // 1. Trigger Button Corner
       panel.appendChild(
-        this._createSelectSetting(
+        this._makeSelectRow(
           "Overlay Button Position",
-          "Corner of the stream player where the Crop pill appears on hover.",
+          "Which corner of the stream player shows the Crop button on hover.",
           [
             { value: "top-right", label: "Top Right" },
             { value: "top-left", label: "Top Left" }
@@ -1053,11 +1003,10 @@
         )
       );
 
-      // 2. Default Ultrawide Slice Ratio
       panel.appendChild(
-        this._createSelectSetting(
-          "Default Left / Center / Right Slice Ratio",
-          "Target monitor aspect ratio extracted when clicking Left, Center, or Right on an ultrawide stream.",
+        this._makeSelectRow(
+          "Left / Center / Right Target Aspect Ratio",
+          "Aspect ratio carved out when clicking Left, Center, or Right on an ultrawide stream.",
           [
             { value: "16:9", label: "16:9 Standard Monitor" },
             { value: "21:9", label: "21:9 Ultrawide" },
@@ -1071,11 +1020,10 @@
         )
       );
 
-      // 3. Auto-Remember Last Crop Per Streamer / Stream
       panel.appendChild(
-        this._createToggleSetting(
-          "Auto-Remember Crop When Switching Streams",
-          "Automatically restores your exact crop when you click off someone's stream and click back onto it.",
+        this._makeToggleRow(
+          "Remember Crop Per Streamer",
+          "Restores your last crop automatically if you click off someone's stream and click back.",
           this.settings.rememberPerStreamer,
           (checked) => {
             this.settings.rememberPerStreamer = checked;
@@ -1084,11 +1032,10 @@
         )
       );
 
-      // 4. Auto-Crop Ultrawide Streams
       panel.appendChild(
-        this._createToggleSetting(
+        this._makeToggleRow(
           "Auto-Center Ultrawide Streams (21:9 / 32:9)",
-          "Automatically apply a clean 16:9 Center crop whenever a wide ultrawide screen share starts.",
+          "Automatically start in Center crop whenever an ultrawide screen share opens.",
           this.settings.autoCenterUltrawide,
           (checked) => {
             this.settings.autoCenterUltrawide = checked;
@@ -1097,11 +1044,10 @@
         )
       );
 
-      // 4. Show Cropped Resolution in Pill
       panel.appendChild(
-        this._createToggleSetting(
-          "Show Active Resolution on Crop Pill",
-          "Displays the live cropped pixel output (e.g. 2560×1440) next to the Crop pill when active.",
+        this._makeToggleRow(
+          "Show Cropped Resolution on Pill",
+          "Shows the active output dimensions (e.g. 2560×1440) next to the Crop button.",
           this.settings.showResolutionBadge,
           (checked) => {
             this.settings.showResolutionBadge = checked;
@@ -1114,66 +1060,70 @@
       return panel;
     }
 
-    _createSelectSetting(title, desc, options, currentVal, onChange) {
+    _makeSelectRow(title, desc, options, currentVal, onChange) {
       const row = document.createElement("div");
       row.className = "dsc-setting-row";
 
       const info = document.createElement("div");
       info.className = "dsc-setting-info";
-      const t = document.createElement("div");
-      t.className = "dsc-setting-title";
-      t.textContent = title;
-      const d = document.createElement("div");
-      d.className = "dsc-setting-desc";
-      d.textContent = desc;
-      info.appendChild(t);
-      info.appendChild(d);
+      const titleEl = document.createElement("div");
+      titleEl.className = "dsc-setting-title";
+      titleEl.textContent = title;
+      const descEl = document.createElement("div");
+      descEl.className = "dsc-setting-desc";
+      descEl.textContent = desc;
+      info.appendChild(titleEl);
+      info.appendChild(descEl);
 
-      const sel = document.createElement("select");
-      sel.className = "dsc-setting-select";
+      const select = document.createElement("select");
+      select.className = "dsc-setting-select";
       for (const opt of options) {
-        const o = document.createElement("option");
-        o.value = opt.value;
-        o.textContent = opt.label;
-        if (opt.value === currentVal) o.selected = true;
-        sel.appendChild(o);
+        const optionEl = document.createElement("option");
+        optionEl.value = opt.value;
+        optionEl.textContent = opt.label;
+        if (opt.value === currentVal) optionEl.selected = true;
+        select.appendChild(optionEl);
       }
-      sel.addEventListener("change", () => onChange(sel.value));
+      select.addEventListener("change", () => onChange(select.value));
 
       row.appendChild(info);
-      row.appendChild(sel);
+      row.appendChild(select);
       return row;
     }
 
-    _createToggleSetting(title, desc, currentVal, onChange) {
+    _makeToggleRow(title, desc, currentVal, onChange) {
       const row = document.createElement("div");
       row.className = "dsc-setting-row";
 
       const info = document.createElement("div");
       info.className = "dsc-setting-info";
-      const t = document.createElement("div");
-      t.className = "dsc-setting-title";
-      t.textContent = title;
-      const d = document.createElement("div");
-      d.className = "dsc-setting-desc";
-      d.textContent = desc;
-      info.appendChild(t);
-      info.appendChild(d);
+      const titleEl = document.createElement("div");
+      titleEl.className = "dsc-setting-title";
+      titleEl.textContent = title;
+      const descEl = document.createElement("div");
+      descEl.className = "dsc-setting-desc";
+      descEl.textContent = desc;
+      info.appendChild(titleEl);
+      info.appendChild(descEl);
 
-      const cb = document.createElement("input");
-      cb.type = "checkbox";
-      cb.className = "dsc-setting-checkbox";
-      cb.checked = Boolean(currentVal);
-      cb.addEventListener("change", () => onChange(cb.checked));
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.className = "dsc-setting-checkbox";
+      checkbox.checked = Boolean(currentVal);
+      checkbox.addEventListener("change", () => onChange(checkbox.checked));
 
       row.appendChild(info);
-      row.appendChild(cb);
+      row.appendChild(checkbox);
       return row;
     }
 
     _injectStyles() {
+      if (this.api && this.api.DOM && typeof this.api.DOM.addStyle === "function") {
+        this.api.DOM.addStyle(STYLES);
+        return;
+      }
       if (typeof BdApi !== "undefined" && BdApi.DOM && typeof BdApi.DOM.addStyle === "function") {
-        BdApi.DOM.addStyle(STYLE_ID, CSS_STYLES);
+        BdApi.DOM.addStyle(STYLE_ID, STYLES);
         return;
       }
       let styleEl = document.getElementById(STYLE_ID);
@@ -1182,11 +1132,13 @@
         styleEl.id = STYLE_ID;
         (document.head || document.documentElement).appendChild(styleEl);
       }
-      styleEl.textContent = CSS_STYLES;
+      styleEl.textContent = STYLES;
     }
 
     _removeStyles() {
-      if (typeof BdApi !== "undefined" && BdApi.DOM && typeof BdApi.DOM.removeStyle === "function") {
+      if (this.api && this.api.DOM && typeof this.api.DOM.removeStyle === "function") {
+        this.api.DOM.removeStyle();
+      } else if (typeof BdApi !== "undefined" && BdApi.DOM && typeof BdApi.DOM.removeStyle === "function") {
         BdApi.DOM.removeStyle(STYLE_ID);
       }
       const styleEl = document.getElementById(STYLE_ID);
@@ -1195,9 +1147,13 @@
 
     _loadData() {
       try {
+        if (this.api && this.api.Data && typeof this.api.Data.load === "function") {
+          const data = this.api.Data.load("config");
+          if (data && typeof data === "object") return data;
+        }
         if (typeof BdApi !== "undefined" && BdApi.Data && typeof BdApi.Data.load === "function") {
-          const loaded = BdApi.Data.load(PLUGIN_NAME, "config");
-          if (loaded && typeof loaded === "object") return loaded;
+          const data = BdApi.Data.load(PLUGIN_NAME, "config");
+          if (data && typeof data === "object") return data;
         }
         if (typeof localStorage !== "undefined") {
           const raw = localStorage.getItem(STORAGE_KEY);
@@ -1206,9 +1162,7 @@
             if (parsed && typeof parsed === "object") return parsed;
           }
         }
-      } catch (_e) {
-        // Ignore malformed storage
-      }
+      } catch (_e) {}
       return {};
     }
 
@@ -1219,27 +1173,41 @@
         rememberedCrops: this.rememberedCrops.slice(0, MAX_REMEMBERED_STREAMS)
       };
       try {
-        if (typeof BdApi !== "undefined" && BdApi.Data && typeof BdApi.Data.save === "function") {
+        if (this.api && this.api.Data && typeof this.api.Data.save === "function") {
+          this.api.Data.save("config", payload);
+        } else if (typeof BdApi !== "undefined" && BdApi.Data && typeof BdApi.Data.save === "function") {
           BdApi.Data.save(PLUGIN_NAME, "config", payload);
         }
         if (typeof localStorage !== "undefined") {
           localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
         }
-      } catch (_e) {
-        // Ignore storage write errors
+      } catch (_e) {}
+    }
+
+    showToast(message, type = "info") {
+      if (typeof BdApi !== "undefined" && BdApi.UI && typeof BdApi.UI.showToast === "function") {
+        BdApi.UI.showToast(message, { type });
       }
     }
 
-    /**
-     * Record or clear the active crop for a stream across 3 fallback identity tiers:
-     * 1) Exact live WebRTC `stream.id` / video `track.id` (instant in-call switch back)
-     * 2) Streamer display name + resolution (`streamer:alex|5120x1440` — persists across calls & restarts!)
-     * 3) Ultrawide resolution profile (`res:5120x1440` — fallback when Discord hides the name overlay)
-     */
+    attachTooltip(node, text) {
+      if (!node) return null;
+      if (typeof BdApi !== "undefined" && BdApi.UI && typeof BdApi.UI.createTooltip === "function") {
+        try {
+          return BdApi.UI.createTooltip(node, text, { side: "bottom", style: "primary" });
+        } catch (_e) {}
+      }
+      node.title = text;
+      return null;
+    }
+
+    // Store crop per stream so accidentally clicking another call tile or channel
+    // and coming back puts your crop right back where it was.
     rememberStreamCrop(identities, region, preset) {
       if (!this.settings.rememberPerStreamer || !identities) return;
-      const full = isFullRegion(region);
-      const entry = full
+
+      const isFull = isFullRegion(region);
+      const record = isFull
         ? null
         : {
             region: normalizeRegion(region),
@@ -1249,59 +1217,51 @@
 
       for (const sessionKey of identities.sessionKeys || []) {
         if (!sessionKey) continue;
-        if (full) this._sessionStreamMemory.delete(sessionKey);
-        else this._sessionStreamMemory.set(sessionKey, entry);
+        if (isFull) this._sessionMemory.delete(sessionKey);
+        else this._sessionMemory.set(sessionKey, record);
       }
 
-      let changedPersistent = false;
-      for (const persistKey of identities.persistentKeys || []) {
-        if (!persistKey) continue;
-        const existingIdx = this.rememberedCrops.findIndex((item) => item && item.key === persistKey);
-        if (full) {
-          if (existingIdx >= 0) {
-            this.rememberedCrops.splice(existingIdx, 1);
-            changedPersistent = true;
+      let dirty = false;
+      for (const key of identities.persistentKeys || []) {
+        if (!key) continue;
+        const idx = this.rememberedCrops.findIndex((item) => item && item.key === key);
+        if (isFull) {
+          if (idx >= 0) {
+            this.rememberedCrops.splice(idx, 1);
+            dirty = true;
           }
         } else {
-          if (existingIdx >= 0) {
-            this.rememberedCrops.splice(existingIdx, 1);
-          }
+          if (idx >= 0) this.rememberedCrops.splice(idx, 1);
           this.rememberedCrops.push({
-            key: persistKey,
-            region: entry.region,
-            preset: entry.preset,
-            updatedAt: entry.updatedAt
+            key,
+            region: record.region,
+            preset: record.preset,
+            updatedAt: record.updatedAt
           });
           while (this.rememberedCrops.length > MAX_REMEMBERED_STREAMS) {
             this.rememberedCrops.shift();
           }
-          changedPersistent = true;
+          dirty = true;
         }
       }
 
-      if (changedPersistent) {
-        this._saveData();
-      }
+      if (dirty) this._saveData();
     }
 
     recallStreamCrop(identities) {
       if (!this.settings.rememberPerStreamer || !identities) return null;
 
-      // Tier 1: Exact WebRTC stream/track ID in this call
       for (const sessionKey of identities.sessionKeys || []) {
-        if (sessionKey && this._sessionStreamMemory.has(sessionKey)) {
-          return this._sessionStreamMemory.get(sessionKey);
+        if (sessionKey && this._sessionMemory.has(sessionKey)) {
+          return this._sessionMemory.get(sessionKey);
         }
       }
 
-      // Tier 2 & 3: Streamer + resolution, or specific ultrawide resolution profile (newest match wins)
-      for (const persistKey of identities.persistentKeys || []) {
-        if (!persistKey) continue;
+      for (const key of identities.persistentKeys || []) {
+        if (!key) continue;
         for (let i = this.rememberedCrops.length - 1; i >= 0; i--) {
           const item = this.rememberedCrops[i];
-          if (item && item.key === persistKey && item.region) {
-            return item;
-          }
+          if (item && item.key === key && item.region) return item;
         }
       }
 
@@ -1358,15 +1318,14 @@
     }
 
     _handleKeyDown(event) {
-      if (event.key === "Escape") {
-        for (const controller of this._controllers.values()) {
-          if (controller.isDrawing) {
-            event.stopPropagation();
-            event.preventDefault();
-            controller.closeDrawModal();
-          } else if (controller.isOpen) {
-            controller.closeHud();
-          }
+      if (event.key !== "Escape") return;
+      for (const controller of this._controllers.values()) {
+        if (controller.isDrawing) {
+          event.stopPropagation();
+          event.preventDefault();
+          controller.closeDrawModal();
+        } else if (controller.isOpen) {
+          controller.closeHud();
         }
       }
     }
@@ -1375,17 +1334,18 @@
       if (!video || video.nodeName !== "VIDEO" || !video.isConnected) return false;
       if (video.dataset && video.dataset.dscInternal === "true") return false;
 
-      // A live Discord screen share / camera stream always has a MediaStream in `srcObject`
-      const stream = this._interceptor.getRawSrcObject(video);
-      const hasMediaStream = typeof MediaStream !== "undefined" && stream instanceof MediaStream;
-      if (!hasMediaStream) return false;
+      // Active WebRTC streams always populate `video.srcObject` with a MediaStream,
+      // whereas GIFv / Tenor / animated avatars use `src` URLs.
+      const stream = video.srcObject;
+      if (typeof MediaStream === "undefined" || !(stream instanceof MediaStream)) {
+        return false;
+      }
 
       const rect = video.getBoundingClientRect ? video.getBoundingClientRect() : null;
       const width = video.clientWidth || (rect ? rect.width : 0);
       const height = video.clientHeight || (rect ? rect.height : 0);
 
-      // Exclude small participant tile preview thumbnails (< 200x150) so only the main watched stream gets the button
-      return width > MIN_VIDEO_WIDTH && height > MIN_VIDEO_HEIGHT;
+      return width > MIN_STAGE_VIDEO_WIDTH && height > MIN_STAGE_VIDEO_HEIGHT;
     }
 
     scan() {
@@ -1403,7 +1363,7 @@
       const videos = document.querySelectorAll("video");
       for (const video of videos) {
         if (!this._controllers.has(video) && this.isEligibleStreamVideo(video)) {
-          const controller = new VideoSourceController(video, this, this._interceptor);
+          const controller = new VideoSourceController(video, this);
           controller.mount();
           this._controllers.set(video, controller);
         }
@@ -1411,19 +1371,19 @@
     }
   }
 
-  /**
-   * Per-stream controller that crops `<video>.srcObject` at the MediaStream source level
-   * and mounts a clean, non-intrusive selector HUD without touching `<video>` CSS!
-   */
   class VideoSourceController {
-    constructor(video, manager, interceptor) {
+    constructor(video, manager) {
       this.video = video;
       this.manager = manager;
-      this.interceptor = interceptor;
 
-      this.originalStream = interceptor.getRawSrcObject(video);
+      this.originalStream = video.srcObject;
+      this._nativeSrcDesc = null;
       this.cropSession = null;
-      this.sourceMonitorVideo = null; // Hidden monitor <video> tracking the uncropped original stream for minimap/draw preview
+
+      // Secondary muted <video> attached to the uncropped `originalStream` so our
+      // minimap and Draw Custom Region modal still show the full monitor even
+      // after `this.video.srcObject` has been swapped to the cropped stream.
+      this.sourceMonitorVideo = null;
 
       this.region = { ...FULL_REGION };
       this.activePreset = "full";
@@ -1444,6 +1404,7 @@
       this.savedRowEl = null;
       this.drawModalEl = null;
       this.drawModalRaf = null;
+      this._tooltips = [];
       this._presetBtns = new Map();
 
       this._minimapRaf = null;
@@ -1456,11 +1417,9 @@
       this._onVideoResize = () => this._handleStreamMetadata();
     }
 
-    /**
-     * Find the stream player container above `<video>` (stopping before any container
-     * that also holds the bottom participant tile row) so the top-right `Crop` pill
-     * sits cleanly in the corner of the player without touching `<video>` styles!
-     */
+    // Climb out of the inner `<video>` flex box so the `Crop` button sits in the
+    // top corner of the full stream stage, but stop before climbing into the outer
+    // call container that also wraps the participant avatar row at the bottom.
     _resolveHostContainer() {
       const immediate = this.video.parentElement;
       if (!immediate) return null;
@@ -1491,7 +1450,7 @@
         const rect = cur.getBoundingClientRect ? cur.getBoundingClientRect() : null;
         const w = cur.clientWidth || (rect ? rect.width : 0);
         const h = cur.clientHeight || (rect ? rect.height : 0);
-        if (w >= MIN_VIDEO_WIDTH && h >= MIN_VIDEO_HEIGHT) {
+        if (w >= MIN_STAGE_VIDEO_WIDTH && h >= MIN_STAGE_VIDEO_HEIGHT) {
           best = cur;
         }
 
@@ -1513,12 +1472,14 @@
         this.promotedHostPos = true;
       }
 
-      // Reconcile `video.srcObject` purely via per-element event listeners + own-property accessor
-      // (ZERO prototype or global modifications — strictly compliant with BetterDiscord Plugin Guidelines!)
-      this._installElementSrcProperty();
-
+      this._installVideoSrcHook();
       this._buildUI();
       host.appendChild(this.rootEl);
+
+      // If React purges custom child nodes inside `host` while keeping the stream
+      // alive, re-append our overlay immediately via BetterDiscord's DOM helper.
+      this._offRemoved = null;
+      this._watchOverlayRemoval();
 
       host.addEventListener("mouseenter", this._onHostEnter);
       host.addEventListener("mousemove", this._onHostMove, { passive: true });
@@ -1530,24 +1491,41 @@
       this.syncUI();
     }
 
-    _installElementSrcProperty() {
-      this._removeElementSrcProperty();
-      const proto = Object.getPrototypeOf(this.video);
+    _setNativeSrcObject(stream) {
+      if (this._nativeSrcDesc && typeof this._nativeSrcDesc.set === "function") {
+        this._nativeSrcDesc.set.call(this.video, stream);
+      } else {
+        this.video.srcObject = stream;
+      }
+    }
+
+    _getNativeSrcObject() {
+      if (this._nativeSrcDesc && typeof this._nativeSrcDesc.get === "function") {
+        return this._nativeSrcDesc.get.call(this.video);
+      }
+      return this.video.srcObject;
+    }
+
+    // Discord's React tree periodically re-renders the player and re-runs
+    // `video.srcObject = originalStream`. We shadow `srcObject` on this single
+    // `<video>` instance (never on HTMLMediaElement.prototype) so React re-renders
+    // don't clobber an active crop, while genuine stream switches are caught cleanly.
+    _installVideoSrcHook() {
+      this._removeVideoSrcHook();
+
       let desc = null;
-      let curProto = proto;
-      while (curProto && !desc) {
-        desc = Object.getOwnPropertyDescriptor(curProto, "srcObject");
-        curProto = Object.getPrototypeOf(curProto);
+      let proto = Object.getPrototypeOf(this.video);
+      while (proto && !desc) {
+        desc = Object.getOwnPropertyDescriptor(proto, "srcObject");
+        proto = Object.getPrototypeOf(proto);
       }
       if (!desc || typeof desc.get !== "function" || typeof desc.set !== "function") {
         return;
       }
 
-      this._nativeElementSrcDesc = desc;
-      const self = this;
+      this._nativeSrcDesc = desc;
+      const controller = this;
 
-      // Shadow `srcObject` ONLY on this specific `<video>` element instance (deleted on `destroy()`),
-      // never modifying `HTMLMediaElement.prototype` or any global prototype!
       Object.defineProperty(this.video, "srcObject", {
         configurable: true,
         enumerable: desc.enumerable,
@@ -1561,59 +1539,56 @@
           }
 
           if (!incomingStream) {
-            self._teardownCropSession(false);
-            self.originalStream = null;
+            controller._teardownCropSession(false);
+            controller.originalStream = null;
             desc.set.call(this, null);
             return;
           }
 
-          // Discord React re-rendered and re-assigned the SAME underlying raw stream:
-          // Keep our cropped stream attached without flicker!
-          if (self.originalStream && incomingStream === self.originalStream) {
-            if (self.cropSession && self.cropSession.outputStream) {
-              desc.set.call(this, self.cropSession.outputStream);
+          // React re-assigned the exact same stream we're already cropping — keep our cropped output alive.
+          if (controller.originalStream && incomingStream === controller.originalStream) {
+            if (controller.cropSession && controller.cropSession.outputStream) {
+              desc.set.call(this, controller.cropSession.outputStream);
               return;
             }
             desc.set.call(this, incomingStream);
             return;
           }
 
-          // Discord switched to a DIFFERENT raw stream (e.g. user clicked another streamer and came back):
-          self.originalStream = incomingStream;
-          self._didAutoCrop = false;
-          if (self.sourceMonitorVideo) {
-            self.sourceMonitorVideo.srcObject = incomingStream;
+          // User switched to watching a different stream on the same `<video>` element.
+          controller.originalStream = incomingStream;
+          controller._didAutoCrop = false;
+          if (controller.sourceMonitorVideo) {
+            controller.sourceMonitorVideo.srcObject = incomingStream;
           }
 
-          const recalled = self.manager.recallStreamCrop(self._getStreamIdentities());
+          const recalled = controller.manager.recallStreamCrop(controller._getStreamIdentities());
           if (recalled && recalled.region && !isFullRegion(recalled.region)) {
-            self.region = normalizeRegion(recalled.region);
-            self.activePreset = recalled.preset || "custom";
-            self._didAutoCrop = true;
-            self._rebuildCropSession();
-            self.syncUI();
+            controller.region = normalizeRegion(recalled.region);
+            controller.activePreset = recalled.preset || "custom";
+            controller._didAutoCrop = true;
+            controller._rebuildCropSession();
+            controller.syncUI();
             return;
           }
 
-          self._teardownCropSession(false);
-          self.region = { ...FULL_REGION };
-          self.activePreset = "full";
+          // Don't carry someone's ultrawide crop over onto a different streamer's 16:9 feed.
+          controller._teardownCropSession(false);
+          controller.region = { ...FULL_REGION };
+          controller.activePreset = "full";
           desc.set.call(this, incomingStream);
-          self._handleStreamMetadata();
-          self.syncUI();
+          controller._handleStreamMetadata();
+          controller.syncUI();
         }
       });
     }
 
-    _removeElementSrcProperty() {
-      if (this._nativeElementSrcDesc) {
-        try {
-          delete this.video.srcObject;
-        } catch (_e) {
-          // Ignore cleanup error if already detached
-        }
-        this._nativeElementSrcDesc = null;
-      }
+    _removeVideoSrcHook() {
+      if (!this._nativeSrcDesc) return;
+      try {
+        delete this.video.srcObject;
+      } catch (_e) {}
+      this._nativeSrcDesc = null;
     }
 
     ensureMounted() {
@@ -1622,12 +1597,12 @@
         this.host.appendChild(this.rootEl);
       }
 
-      const currentRaw = this.interceptor.getRawSrcObject(this.video);
-      if (currentRaw && !CROPPED_STREAMS.has(currentRaw) && currentRaw !== this.originalStream) {
-        this.originalStream = currentRaw;
+      const current = this._getNativeSrcObject();
+      if (current && !CROPPED_STREAMS.has(current) && current !== this.originalStream) {
+        this.originalStream = current;
         this._didAutoCrop = false;
         if (this.sourceMonitorVideo) {
-          this.sourceMonitorVideo.srcObject = currentRaw;
+          this.sourceMonitorVideo.srcObject = current;
         }
         const recalled = this.manager.recallStreamCrop(this._getStreamIdentities());
         if (recalled && recalled.region && !isFullRegion(recalled.region)) {
@@ -1646,16 +1621,41 @@
       }
     }
 
+    _watchOverlayRemoval() {
+      if (this._offRemoved) {
+        try {
+          this._offRemoved();
+        } catch (_e) {}
+        this._offRemoved = null;
+      }
+      if (!this.rootEl || typeof BdApi === "undefined" || !BdApi.DOM || typeof BdApi.DOM.onRemoved !== "function") {
+        return;
+      }
+      this._offRemoved = BdApi.DOM.onRemoved(this.rootEl, () => {
+        if (this.host && this.host.isConnected && this.video.isConnected && this.rootEl) {
+          this.host.appendChild(this.rootEl);
+          this._watchOverlayRemoval();
+        }
+      });
+    }
+
     destroy() {
       this.closeDrawModal();
       this._stopMinimapLoop();
+
+      if (this._offRemoved) {
+        try {
+          this._offRemoved();
+        } catch (_e) {}
+        this._offRemoved = null;
+      }
 
       if (this._hoverTimer) {
         clearTimeout(this._hoverTimer);
         this._hoverTimer = null;
       }
 
-      this._removeElementSrcProperty();
+      this._removeVideoSrcHook();
       this._teardownCropSession(true);
       this._destroySourceMonitor();
 
@@ -1673,6 +1673,16 @@
       this.video.removeEventListener("loadedmetadata", this._onVideoResize);
       this.video.removeEventListener("resize", this._onVideoResize);
 
+      if (this._tooltips.length) {
+        for (const tip of this._tooltips) {
+          try {
+            if (tip && typeof tip.destroy === "function") tip.destroy();
+            else if (tip && typeof tip.hide === "function") tip.hide();
+          } catch (_e) {}
+        }
+        this._tooltips = [];
+      }
+
       if (this.rootEl) {
         this.rootEl.remove();
         this.rootEl = null;
@@ -1680,30 +1690,28 @@
       this.host = null;
     }
 
-    /**
-     * Extract non-fragile stream identity keys without relying on obfuscated Discord class names:
-     * - `sessionKeys`: WebRTC `stream.id` and primary video `track.id`
-     * - `persistentKeys`: Streamer display badge text inside the player host + source resolution,
-     *   plus ultrawide source resolution fallback (`res:5120x1440`) when aspect > 2.0.
-     */
+    // Grab the streamer's display name from Discord's overlay badge without relying
+    // on hashed Discord class names that break on client updates.
     _extractStreamerLabel() {
       if (!this.host || !this.host.querySelectorAll) return "";
-      const candidates = this.host.querySelectorAll("span, div");
-      for (const el of candidates) {
+      const nodes = this.host.querySelectorAll("span, div");
+      for (const el of nodes) {
         if (this.rootEl && this.rootEl.contains(el)) continue;
         if (el.children && el.children.length > 0) continue;
-        const txt = String(el.textContent || "").trim();
+        const text = String(el.textContent || "").trim();
         if (
-          txt.length >= 2 &&
-          txt.length <= 32 &&
-          !/^(LIVE|HD|FHD|QHD|4K|1080p|720p|1440p|60|30|FPS|\d+[:x×]\d+)$/i.test(txt)
+          text.length >= 2 &&
+          text.length <= 32 &&
+          !/^(LIVE|HD|FHD|QHD|4K|1080p|720p|1440p|60|30|FPS|\d+[:x×]\d+)$/i.test(text)
         ) {
-          return txt.toLowerCase();
+          return text.toLowerCase();
         }
       }
       return "";
     }
 
+    // Build lookup keys from most specific (live WebRTC stream/track IDs) to
+    // durable across reconnects (streamer badge + resolution, or ultrawide resolution).
     _getStreamIdentities() {
       const sessionKeys = [];
       const persistentKeys = [];
@@ -1719,17 +1727,16 @@
       }
 
       const dims = this._getOriginalDimensions();
-      const hasKnownDims = dims.width > 0 && dims.height > 0;
+      const hasDims = dims.width > 0 && dims.height > 0;
       const streamer = this._extractStreamerLabel();
 
-      if (streamer && hasKnownDims) {
+      if (streamer && hasDims) {
         persistentKeys.push(`streamer:${streamer}|${dims.width}x${dims.height}`);
       }
       if (streamer) {
         persistentKeys.push(`streamer:${streamer}`);
       }
-      // Also remember ultrawide monitor resolutions (e.g., 5120x1440 / 3440x1440) even before badge text renders
-      if (hasKnownDims && dims.width / Math.max(1, dims.height) > 2.05) {
+      if (hasDims && dims.width / Math.max(1, dims.height) > 2.05) {
         persistentKeys.push(`ultrawide-res:${dims.width}x${dims.height}`);
       }
 
@@ -1740,7 +1747,6 @@
       const dims = this._getOriginalDimensions();
       const aspect = dims.width / Math.max(1, dims.height);
 
-      // 1) Auto-restore remembered crop for this streamer / stream when clicking back onto their stream!
       if (!this._didAutoCrop && isFullRegion(this.region)) {
         const recalled = this.manager.recallStreamCrop(this._getStreamIdentities());
         if (recalled && recalled.region && !isFullRegion(recalled.region)) {
@@ -1753,7 +1759,6 @@
         }
       }
 
-      // 2) Optional fallback setting: automatically center-crop ultrawide (21:9 / 32:9) streams on join
       if (
         !this._didAutoCrop &&
         this.manager.settings.autoCenterUltrawide &&
@@ -1765,6 +1770,7 @@
         this.applyPreset("center");
         return;
       }
+
       this.syncUI();
     }
 
@@ -1793,7 +1799,9 @@
       }, 2200);
     }
 
-    _shieldElement(el) {
+    // Stop clicks, double-clicks, drags, and wheel events on our UI from bubbling
+    // into Discord's player (where double-click toggles fullscreen).
+    _shieldEvents(el) {
       const events = ["click", "dblclick", "mousedown", "mouseup", "pointerdown", "pointerup", "contextmenu", "wheel"];
       for (const evt of events) {
         el.addEventListener(
@@ -1807,10 +1815,6 @@
       }
     }
 
-    /**
-     * Read the uncropped original stream's intrinsic pixel dimensions even while
-     * `this.video.srcObject` is currently displaying the cropped stream!
-     */
     _getOriginalDimensions() {
       if (this.sourceMonitorVideo && this.sourceMonitorVideo.videoWidth > 0 && this.sourceMonitorVideo.videoHeight > 0) {
         return {
@@ -1824,9 +1828,9 @@
           ? this.originalStream.getVideoTracks()
           : [];
       if (vTracks.length && typeof vTracks[0].getSettings === "function") {
-        const s = vTracks[0].getSettings();
-        if (s && s.width > 0 && s.height > 0) {
-          return { width: s.width, height: s.height };
+        const settings = vTracks[0].getSettings();
+        if (settings && settings.width > 0 && settings.height > 0) {
+          return { width: settings.width, height: settings.height };
         }
       }
 
@@ -1848,20 +1852,20 @@
         return this.sourceMonitorVideo;
       }
 
-      const v = document.createElement("video");
-      v.dataset.dscInternal = "true";
-      v.muted = true;
-      v.autoplay = true;
-      v.playsInline = true;
+      const monitor = document.createElement("video");
+      monitor.dataset.dscInternal = "true";
+      monitor.muted = true;
+      monitor.autoplay = true;
+      monitor.playsInline = true;
       if (this.originalStream) {
-        v.srcObject = this.originalStream;
+        monitor.srcObject = this.originalStream;
       }
-      if (typeof v.play === "function") {
-        const p = v.play();
+      if (typeof monitor.play === "function") {
+        const p = monitor.play();
         if (p && typeof p.catch === "function") p.catch(() => {});
       }
-      this.sourceMonitorVideo = v;
-      return v;
+      this.sourceMonitorVideo = monitor;
+      return monitor;
     }
 
     _destroySourceMonitor() {
@@ -1869,15 +1873,10 @@
       try {
         if (typeof this.sourceMonitorVideo.pause === "function") this.sourceMonitorVideo.pause();
         this.sourceMonitorVideo.srcObject = null;
-      } catch (_e) {
-        // Ignore cleanup error
-      }
+      } catch (_e) {}
       this.sourceMonitorVideo = null;
     }
 
-    /* ======================================================================
-     * Real MediaStream Source Replacement (`video.srcObject = croppedStream`)
-     * ====================================================================== */
     _applySourceCrop() {
       if (isFullRegion(this.region)) {
         this._teardownCropSession(true);
@@ -1885,7 +1884,7 @@
       }
 
       if (!this.originalStream) {
-        const cur = this.interceptor.getRawSrcObject(this.video);
+        const cur = this._getNativeSrcObject();
         if (cur && !CROPPED_STREAMS.has(cur)) {
           this.originalStream = cur;
         }
@@ -1895,9 +1894,6 @@
       this._ensureSourceMonitor();
 
       if (this.cropSession && !this.cropSession.disposed && this.cropSession.sourceStream === this.originalStream) {
-        // Live-update crop rectangle on existing WebCodecs/Canvas stream — zero stream re-attach needed!
-        // Discord's `<video>` automatically receives frames at the new `visibleRect` dimensions and
-        // fires its native `resize` listener to adjust layout & native zoom!
         this.cropSession.setRegion(this.region);
         return;
       }
@@ -1918,21 +1914,21 @@
       if (!croppedStream) return;
 
       this.cropSession = session;
-      this.interceptor.setRawSrcObject(this.video, croppedStream);
+      this._setNativeSrcObject(croppedStream);
       if (typeof this.video.play === "function") {
         const p = this.video.play();
         if (p && typeof p.catch === "function") p.catch(() => {});
       }
     }
 
-    _teardownCropSession(restoreOriginalToVideo) {
+    _teardownCropSession(restoreOriginal) {
       const hadSession = Boolean(this.cropSession);
       if (this.cropSession) {
         this.cropSession.stop();
         this.cropSession = null;
       }
-      if (restoreOriginalToVideo && hadSession && this.originalStream && this.video.isConnected) {
-        this.interceptor.setRawSrcObject(this.video, this.originalStream);
+      if (restoreOriginal && hadSession && this.originalStream && this.video.isConnected) {
+        this._setNativeSrcObject(this.originalStream);
         if (typeof this.video.play === "function") {
           const p = this.video.play();
           if (p && typeof p.catch === "function") p.catch(() => {});
@@ -1940,18 +1936,15 @@
       }
     }
 
-    /* ======================================================================
-     * Clean, Polished UI Construction
-     * ====================================================================== */
     _buildUI() {
       const root = document.createElement("div");
       root.className = "dsc-root";
 
-      // 1. Floating Pill Trigger
       const trigger = document.createElement("button");
       trigger.type = "button";
       trigger.className = "dsc-trigger";
-      trigger.title = "Crop stream source (Discord natively fills & zooms the cropped feed)";
+      const triggerTip = this.manager.attachTooltip(trigger, "Crop stream source");
+      if (triggerTip) this._tooltips.push(triggerTip);
       trigger.innerHTML = `${ICONS.crop}<span>Crop</span>`;
 
       const resSpan = document.createElement("span");
@@ -1961,18 +1954,16 @@
       trigger.appendChild(resSpan);
       trigger.appendChild(dotSpan);
 
-      this._shieldElement(trigger);
+      this._shieldEvents(trigger);
       trigger.addEventListener("click", (e) => {
         e.preventDefault();
         this.toggleHud();
       });
 
-      // 2. Source Selector Popover HUD
       const hud = document.createElement("div");
       hud.className = "dsc-hud";
-      this._shieldElement(hud);
+      this._shieldEvents(hud);
 
-      // Header: Title + Live Output Resolution + Reset + Close
       const header = document.createElement("div");
       header.className = "dsc-header";
 
@@ -1996,14 +1987,14 @@
       const resetBtn = document.createElement("button");
       resetBtn.type = "button";
       resetBtn.className = "dsc-icon-btn dsc-reset-btn";
-      resetBtn.title = "Restore full uncropped stream";
+      resetBtn.title = "Restore uncropped stream";
       resetBtn.innerHTML = `${ICONS.reset}<span>Reset</span>`;
       resetBtn.addEventListener("click", () => this.reset());
 
       const closeBtn = document.createElement("button");
       closeBtn.type = "button";
       closeBtn.className = "dsc-icon-btn";
-      closeBtn.title = "Close panel (cropped source stays active)";
+      closeBtn.title = "Close panel";
       closeBtn.innerHTML = ICONS.close;
       closeBtn.addEventListener("click", () => this.closeHud());
 
@@ -2013,33 +2004,31 @@
       header.appendChild(headerBtns);
       hud.appendChild(header);
 
-      // Quick Presets Row: Full | Left | Center | Right | 21:9
       const chips = document.createElement("div");
       chips.className = "dsc-chips";
       const presets = [
         { id: "full", label: "Full", title: "Original uncropped stream" },
-        { id: "left", label: "Left", title: "Crop to left monitor / left 16:9 slice" },
-        { id: "center", label: "Center", title: "Crop to center 16:9 monitor" },
-        { id: "right", label: "Right", title: "Crop to right monitor / right 16:9 slice" },
-        { id: "21:9", label: "21:9", title: "Crop source to 21:9 aspect ratio" }
+        { id: "left", label: "Left", title: "Left monitor / slice" },
+        { id: "center", label: "Center", title: "Center monitor / slice" },
+        { id: "right", label: "Right", title: "Right monitor / slice" },
+        { id: "21:9", label: "21:9", title: "Center 21:9 crop" }
       ];
-      for (const p of presets) {
-        const b = document.createElement("button");
-        b.type = "button";
-        b.className = "dsc-chip";
-        b.dataset.preset = p.id;
-        b.textContent = p.label;
-        b.title = p.title;
-        b.addEventListener("click", () => this.applyPreset(p.id));
-        this._presetBtns.set(p.id, b);
-        chips.appendChild(b);
+      for (const preset of presets) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "dsc-chip";
+        btn.dataset.preset = preset.id;
+        btn.textContent = preset.label;
+        btn.title = preset.title;
+        btn.addEventListener("click", () => this.applyPreset(preset.id));
+        this._presetBtns.set(preset.id, btn);
+        chips.appendChild(btn);
       }
       hud.appendChild(chips);
 
-      // Live Full-Stream Minimap with Draggable / Resizable Region Box
       const minimap = document.createElement("div");
       minimap.className = "dsc-minimap";
-      minimap.title = "Drag box to move crop, drag handles to resize, or double-click to reset";
+      minimap.title = "Drag box to pan, drag handles to resize, or double-click to reset";
 
       const mmCanvas = document.createElement("canvas");
       mmCanvas.className = "dsc-minimap-canvas";
@@ -2049,10 +2038,10 @@
       const box = document.createElement("div");
       box.className = "dsc-minimap-box";
       for (const dir of ["nw", "ne", "sw", "se", "n", "s", "w", "e"]) {
-        const h = document.createElement("div");
-        h.className = `dsc-handle dsc-handle-${dir}`;
-        h.dataset.handle = dir;
-        box.appendChild(h);
+        const handle = document.createElement("div");
+        handle.className = `dsc-handle dsc-handle-${dir}`;
+        handle.dataset.handle = dir;
+        box.appendChild(handle);
       }
 
       minimap.appendChild(mmCanvas);
@@ -2060,36 +2049,39 @@
       this._attachMinimapHandlers(minimap, box);
       hud.appendChild(minimap);
 
-      // Footer: Draw on Full Frame + Save Preset
       const footer = document.createElement("div");
       footer.className = "dsc-footer";
 
       const drawBtn = document.createElement("button");
       drawBtn.type = "button";
       drawBtn.className = "dsc-icon-btn dsc-draw-full-btn";
-      drawBtn.title = "Open full uncropped frame to draw an exact window/region crop";
+      drawBtn.title = "Draw a custom crop box on the full uncropped frame";
       drawBtn.innerHTML = `${ICONS.draw}<span>Draw Custom Region</span>`;
       drawBtn.addEventListener("click", () => this.openDrawModal());
 
       const saveBtn = document.createElement("button");
       saveBtn.type = "button";
       saveBtn.className = "dsc-icon-btn dsc-save-btn";
-      saveBtn.title = "Save current region for 1-click recall";
+      saveBtn.title = "Save current crop preset";
       saveBtn.innerHTML = `${ICONS.bookmark}<span>Save</span>`;
       saveBtn.addEventListener("click", () => {
+        if (isFullRegion(this.region)) {
+          this.manager.showToast("Select a crop area before saving a preset", "warning");
+          return;
+        }
         const count = this.manager.savedPresets.length;
         const label =
           this.activePreset !== "custom" && this.activePreset !== "full"
             ? this.activePreset.toUpperCase()
             : `Crop ${count + 1}`;
         this.manager.savePreset(label, this.region);
+        this.manager.showToast(`Saved "${label}"`, "success");
       });
 
       footer.appendChild(drawBtn);
       footer.appendChild(saveBtn);
       hud.appendChild(footer);
 
-      // Saved Presets Row
       const savedRow = document.createElement("div");
       savedRow.className = "dsc-saved-row";
       hud.appendChild(savedRow);
@@ -2127,15 +2119,17 @@
           const cy = this.region.y + this.region.h / 2;
           let baseW = this.region.w;
           let baseH = this.region.h;
+
           if (isFullRegion(this.region) && e.deltaY < 0) {
             const dims = this._getOriginalDimensions();
             const aspect = dims.width / Math.max(1, dims.height);
-            const target = ASPECT_VALUES[this.manager.settings.defaultSliceAspect] || 16 / 9;
+            const target = ASPECT_RATIOS[this.manager.settings.defaultSliceAspect] || 16 / 9;
             baseW = aspect > target ? clamp(target / aspect, 0.25, 0.9) : 0.85;
             baseH = aspect > target ? 0.9 : 0.85;
           }
-          const nw = clamp(baseW * factor, MIN_CROP_FRAC, 1);
-          const nh = clamp(baseH * factor, MIN_CROP_FRAC, 1);
+
+          const nw = clamp(baseW * factor, MIN_CROP_FRACTION, 1);
+          const nh = clamp(baseH * factor, MIN_CROP_FRACTION, 1);
           if (nw >= 0.995 && nh >= 0.995) {
             this.reset();
             return;
@@ -2199,8 +2193,8 @@
             this.setRegion({
               x: Math.min(originX, curX),
               y: Math.min(originY, curY),
-              w: Math.max(MIN_CROP_FRAC, w),
-              h: Math.max(MIN_CROP_FRAC, h)
+              w: Math.max(MIN_CROP_FRACTION, w),
+              h: Math.max(MIN_CROP_FRACTION, h)
             });
             return;
           }
@@ -2211,10 +2205,10 @@
           let top = startReg.y;
           let bottom = startReg.y + startReg.h;
 
-          if (dir.includes("w")) left = clamp(left + dx, 0, right - MIN_CROP_FRAC);
-          if (dir.includes("e")) right = clamp(right + dx, left + MIN_CROP_FRAC, 1);
-          if (dir.includes("n")) top = clamp(top + dy, 0, bottom - MIN_CROP_FRAC);
-          if (dir.includes("s")) bottom = clamp(bottom + dy, top + MIN_CROP_FRAC, 1);
+          if (dir.includes("w")) left = clamp(left + dx, 0, right - MIN_CROP_FRACTION);
+          if (dir.includes("e")) right = clamp(right + dx, left + MIN_CROP_FRACTION, 1);
+          if (dir.includes("n")) top = clamp(top + dy, 0, bottom - MIN_CROP_FRACTION);
+          if (dir.includes("s")) bottom = clamp(bottom + dy, top + MIN_CROP_FRACTION, 1);
 
           this.activePreset = "custom";
           this.setRegion({
@@ -2286,16 +2280,12 @@
         : this._ensureSourceMonitor();
       try {
         const ctx = this.minimapCanvas.getContext && this.minimapCanvas.getContext("2d");
-        if (!ctx) return;
-        ctx.drawImage(srcVideo, 0, 0, this.minimapCanvas.width, this.minimapCanvas.height);
-      } catch (_e) {
-        // Ignore frame readiness error
-      }
+        if (ctx) ctx.drawImage(srcVideo, 0, 0, this.minimapCanvas.width, this.minimapCanvas.height);
+      } catch (_e) {}
     }
 
-    /* ======================================================================
-     * Full-Source Interactive Draw Modal (Works Even When Stream Is Already Cropped!)
-     * ====================================================================== */
+    // Opens a large view of the uncropped monitor so you can drag a box around a
+    // specific game window or editor pane even while the stream is already cropped.
     openDrawModal() {
       if (this.isDrawing) return;
       this.isDrawing = true;
@@ -2318,11 +2308,11 @@
 
       const modal = document.createElement("div");
       modal.className = "dsc-draw-modal";
-      this._shieldElement(modal);
+      this._shieldEvents(modal);
 
       const bar = document.createElement("div");
       bar.className = "dsc-draw-modal-bar";
-      bar.innerHTML = `<span>Drag across the part of the full ${dims.width}×${dims.height} stream you want Discord to display</span>`;
+      bar.innerHTML = `<span>Drag across the part of the ${dims.width}×${dims.height} stream you want to watch</span>`;
 
       const cancelBtn = document.createElement("button");
       cancelBtn.type = "button";
@@ -2360,9 +2350,7 @@
         try {
           const ctx = canvas.getContext && canvas.getContext("2d");
           if (ctx) ctx.drawImage(monitor, 0, 0, canvas.width, canvas.height);
-        } catch (_e) {
-          // Ignore transient draw error
-        }
+        } catch (_e) {}
         if (typeof requestAnimationFrame === "function") {
           this.drawModalRaf = requestAnimationFrame(drawPreview);
         }
@@ -2417,6 +2405,7 @@
 
         this.closeDrawModal();
 
+        // Ignore accidental clicks without a real drag.
         if (w < 14 || h < 14 || bounds.width <= 0 || bounds.height <= 0) {
           return;
         }
@@ -2479,9 +2468,6 @@
       }
     }
 
-    /* ======================================================================
-     * Actions & UI Synchronization
-     * ====================================================================== */
     toggleHud() {
       if (this.isOpen) this.closeHud();
       else this.openHud();
@@ -2510,21 +2496,21 @@
       this.closeHud();
     }
 
-    setRegion(nextRegion, saveToMemory = true) {
+    setRegion(nextRegion, persist = true) {
       this.region = normalizeRegion(nextRegion);
       if (isFullRegion(this.region)) {
         this.activePreset = "full";
       }
       this._applySourceCrop();
-      if (saveToMemory) {
+      if (persist) {
         this.manager.rememberStreamCrop(this._getStreamIdentities(), this.region, this.activePreset);
       }
       this.syncUI();
     }
 
-    applyPreset(presetId, saveToMemory = true) {
+    applyPreset(presetId, persist = true) {
       if (presetId === "full") {
-        this.reset(saveToMemory);
+        this.reset(persist);
         return;
       }
       const dims = this._getOriginalDimensions();
@@ -2536,19 +2522,19 @@
         this.manager.settings.defaultSliceAspect
       );
       this._applySourceCrop();
-      if (saveToMemory) {
+      if (persist) {
         this.manager.rememberStreamCrop(this._getStreamIdentities(), this.region, this.activePreset);
       }
       this.syncUI();
     }
 
-    reset(saveToMemory = true) {
+    reset(persist = true) {
       this.closeDrawModal();
       this.region = { ...FULL_REGION };
       this.activePreset = "full";
-      this._didAutoCrop = true; // Respect explicit user Reset so metadata events don't re-crop until user chooses
+      this._didAutoCrop = true;
       this._teardownCropSession(true);
-      if (saveToMemory) {
+      if (persist) {
         this.manager.rememberStreamCrop(this._getStreamIdentities(), this.region, "full");
       }
       this.syncUI();
@@ -2578,7 +2564,7 @@
       if (this.metaSpan) {
         this.metaSpan.textContent = cropped
           ? `${outRect.width}×${outRect.height} (from ${dims.width}×${dims.height})`
-          : `${dims.width}×${dims.height} (Original)`;
+          : `${dims.width}×${dims.height}`;
       }
 
       for (const [id, btn] of this._presetBtns.entries()) {
@@ -2608,7 +2594,7 @@
         const pill = document.createElement("button");
         pill.type = "button";
         pill.className = "dsc-saved-pill";
-        pill.title = `Apply saved crop "${item.name}"`;
+        pill.title = `Apply "${item.name}"`;
 
         const nameSpan = document.createElement("span");
         nameSpan.textContent = item.name;
@@ -2635,13 +2621,12 @@
     }
   }
 
-  // Expose pure helpers on the exported class for unit testing (zero `window.*` globals modified!)
-  DiscordStreamCropper.computePixelCropRect = computePixelCropRect;
-  DiscordStreamCropper.computeSourcePreset = computeSourcePreset;
-  DiscordStreamCropper.MediaStreamCropSession = MediaStreamCropSession;
-  DiscordStreamCropper.isCroppedStream = (s) => Boolean(s && CROPPED_STREAMS.has(s));
+  StreamCropper.computePixelCropRect = computePixelCropRect;
+  StreamCropper.computeSourcePreset = computeSourcePreset;
+  StreamCropper.MediaStreamCropSession = MediaStreamCropSession;
+  StreamCropper.isCroppedStream = (s) => Boolean(s && CROPPED_STREAMS.has(s));
 
   if (typeof module !== "undefined" && module.exports) {
-    module.exports = DiscordStreamCropper;
+    module.exports = StreamCropper;
   }
 })();

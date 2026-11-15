@@ -501,10 +501,13 @@ test("1. BetterDiscord submission quality: JSDoc metadata, BdApi integration, st
   assert.doesNotMatch(SOURCE, /Object\.defineProperty\(\s*proto/);
 
   const { env, PluginClass, bdStyles } = loadPlugin({ asBetterDiscord: true });
-  const plugin = new PluginClass();
+  const plugin = new PluginClass({ name: "StreamCropper", version: "1.0.0" });
   plugin.start();
   assert.equal(bdStyles.has("dsc-stream-cropper-styles"), true, "Uses BdApi.DOM.addStyle");
+  assert.equal(typeof plugin.observer, "function", "Implements native BetterDiscord observer(mutation) hook");
+  assert.equal(typeof plugin.onSwitch, "function", "Implements native BetterDiscord onSwitch() hook");
   assert.equal("DiscordStreamCropper" in env.window, false, "Does not pollute window globals");
+  assert.equal("StreamCropper" in env.window, false, "Does not pollute window globals");
 
   // Settings panel builds cleanly for BetterDiscord's plugin settings modal
   const settingsEl = plugin.getSettingsPanel();
