@@ -47,8 +47,13 @@ function createMockDOM({ withWebCodecs = true } = {}) {
     }
     addEventListener(type, fn, opts) {
       const capture = typeof opts === "boolean" ? opts : Boolean(opts && opts.capture);
+      const signal = opts && typeof opts === "object" ? opts.signal : null;
+      if (signal?.aborted) return;
       if (!this._listeners.has(type)) this._listeners.set(type, []);
       this._listeners.get(type).push({ fn, capture });
+      if (signal && typeof signal.addEventListener === "function") {
+        signal.addEventListener("abort", () => this.removeEventListener(type, fn, capture), { once: true });
+      }
     }
     removeEventListener(type, fn, opts) {
       const arr = this._listeners.get(type);
@@ -455,6 +460,14 @@ function loadPlugin({ asBetterDiscord = true, withWebCodecs = true, existingEnv 
         Data: {
           load: (plugin, key) => bdData.get(`${plugin}:${key}`),
           save: (plugin, key, val) => bdData.set(`${plugin}:${key}`, val)
+        },
+        UI: {
+          buildSettingsPanel: (spec) => spec,
+          showToast: () => {},
+          createTooltip: () => ({ destroy() {} })
+        },
+        Logger: {
+          warn: () => {}
         }
       }
     : undefined;
@@ -465,6 +478,9 @@ function loadPlugin({ asBetterDiscord = true, withWebCodecs = true, existingEnv 
     HTMLMediaElement: env.HTMLMediaElement,
     MutationObserver: env.window.MutationObserver,
     MediaStream: env.MediaStream,
+    AbortController,
+    requestAnimationFrame: (cb) => setTimeout(() => cb(Date.now()), 16),
+    cancelAnimationFrame: (id) => clearTimeout(id),
     localStorage: env.localStorage,
     setTimeout,
     clearTimeout,
@@ -509,10 +525,12 @@ test("1. BetterDiscord submission quality: JSDoc metadata, BdApi integration, st
   assert.equal("DiscordStreamCropper" in env.window, false, "Does not pollute window globals");
   assert.equal("StreamCropper" in env.window, false, "Does not pollute window globals");
 
-  // Settings panel builds cleanly for BetterDiscord's plugin settings modal
-  const settingsEl = plugin.getSettingsPanel();
-  assert.equal(settingsEl.classList.contains("dsc-settings-panel"), true);
-  assert.equal(settingsEl.querySelectorAll(".dsc-setting-row").length, 5);
+  // Settings panel delegates directly to BdApi.UI.buildSettingsPanel
+  const settingsSpec = plugin.getSettingsPanel();
+  assert.equal(Array.isArray(settingsSpec.settings), true);
+  assert.equal(settingsSpec.settings.length, 5);
+  settingsSpec.onChange(null, "buttonPosition", "top-left");
+  assert.equal(plugin.settings.buttonPosition, "top-left");
 
   plugin.stop();
   assert.equal(bdStyles.has("dsc-stream-cropper-styles"), false, "Cleans up via BdApi.DOM.removeStyle");

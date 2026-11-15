@@ -29,7 +29,6 @@
 
   const PLUGIN_NAME = "StreamCropper";
   const STYLE_ID = "dsc-stream-cropper-styles";
-  const STORAGE_KEY = "dsc-stream-cropper-data";
 
   const MAX_SAVED_PRESETS = 6;
   const MAX_REMEMBERED_STREAMS = 24;
@@ -38,7 +37,7 @@
   const MIN_STAGE_VIDEO_WIDTH = 200;
   const MIN_STAGE_VIDEO_HEIGHT = 150;
 
-  // Don't let users drag a 1px sliver that breaks WebCodecs frame allocation.
+  // Minimum normalized selection size so WebCodecs never allocates zero-area frames.
   const MIN_CROP_FRACTION = 0.08;
 
   // Track streams we created without tacking custom properties onto MediaStream objects.
@@ -53,6 +52,14 @@
     defaultSliceAspect: "16:9",
     showResolutionBadge: true
   });
+
+  function logWarn(message, err) {
+    if (typeof BdApi !== "undefined" && BdApi.Logger?.warn) {
+      BdApi.Logger.warn(PLUGIN_NAME, message, err ?? "");
+    } else {
+      console.warn(`[${PLUGIN_NAME}] ${message}`, err ?? "");
+    }
+  }
 
   const ASPECT_RATIOS = Object.freeze({
     "16:9": 16 / 9,
@@ -87,9 +94,7 @@
 
     .dsc-root *,
     .dsc-draw-modal,
-    .dsc-draw-modal *,
-    .dsc-settings-panel,
-    .dsc-settings-panel * {
+    .dsc-draw-modal * {
       box-sizing: border-box;
     }
 
@@ -482,61 +487,6 @@
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
     }
-
-    /* Fallback settings layout when running outside BdApi.UI.buildSettingsPanel */
-    .dsc-settings-panel {
-      padding: 12px 4px;
-      color: #dbdee1;
-      font-family: "gg sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      display: flex;
-      flex-direction: column;
-      gap: 14px;
-    }
-
-    .dsc-setting-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      padding-bottom: 12px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-    }
-
-    .dsc-setting-info {
-      display: flex;
-      flex-direction: column;
-      gap: 3px;
-    }
-
-    .dsc-setting-title {
-      font-size: 14px;
-      font-weight: 600;
-      color: #f2f3f5;
-    }
-
-    .dsc-setting-desc {
-      font-size: 12px;
-      color: #949ba4;
-    }
-
-    .dsc-setting-select {
-      height: 32px;
-      padding: 0 10px;
-      border-radius: 6px;
-      border: 1px solid #313338;
-      background: #1e1f22;
-      color: #f2f3f5;
-      font-size: 13px;
-      outline: none;
-      cursor: pointer;
-    }
-
-    .dsc-setting-checkbox {
-      width: 18px;
-      height: 18px;
-      accent-color: #5865f2;
-      cursor: pointer;
-    }
   `;
 
   function clamp(value, min, max) {
@@ -835,537 +785,403 @@
     }
   }
 
-  class StreamCropper {
-    constructor(meta) {
-      this.meta = meta || {};
-      // Scoped BdApi instance (`new BdApi("StreamCropper")`) when running inside BetterDiscord.
-      this.api = typeof BdApi === "function" ? new BdApi(this.meta.name || PLUGIN_NAME) : null;
+  // Owns persisted settings, saved crop presets, and per-streamer crop recall.
+  // Sanitizes external storage once on load so the rest of the plugin can trust it.
+  class CropStore {
+    #dataApi;
+    #sessionMemory = new Map();
 
-      this._running = false;
-      this._controllers = new Map();
-      this._scanTimer = null;
-      this._rescanInterval = null;
+    constructor(dataApi) {
+      this.#dataApi = dataApi;
+      const raw = this.readRaw();
+      const rawSettings = raw.settings && typeof raw.settings === "object" ? raw.settings : {};
 
-      const saved = this._loadData();
-      this.settings = Object.assign({}, DEFAULT_SETTINGS, saved.settings || {});
-      this.savedPresets = Array.isArray(saved.presets)
-        ? saved.presets.slice(0, MAX_SAVED_PRESETS)
-        : [];
-      this.rememberedCrops = Array.isArray(saved.rememberedCrops)
-        ? saved.rememberedCrops.slice(0, MAX_REMEMBERED_STREAMS)
-        : [];
-
-      // Fast in-memory map keyed by WebRTC stream/track IDs for the current voice session.
-      this._sessionMemory = new Map();
-
-      this._onDocPointerDown = this._handleDocPointerDown.bind(this);
-      this._onKeyDown = this._handleKeyDown.bind(this);
-    }
-
-    start() {
-      if (this._running) return;
-      this._running = true;
-
-      this._injectStyles();
-      this.scan();
-
-      document.addEventListener("pointerdown", this._onDocPointerDown, true);
-      document.addEventListener("mousedown", this._onDocPointerDown, true);
-      window.addEventListener("keydown", this._onKeyDown, true);
-
-      // Lightweight check because Discord assigns `video.srcObject` asynchronously
-      // after mounting `<video>`, which doesn't fire a DOM attribute mutation.
-      this._rescanInterval = setInterval(() => {
-        if (this._running) this.scan();
-      }, 1500);
-    }
-
-    // Native BetterDiscord lifecycle hook: BD already runs a single global MutationObserver
-    // and passes every document MutationRecord here, so we don't spin up a second observer.
-    observer(mutation) {
-      if (!this._running) return;
-      if (mutation && mutation.addedNodes && mutation.addedNodes.length > 0) {
-        this._scheduleScan();
-      } else if (mutation && mutation.removedNodes && mutation.removedNodes.length > 0) {
-        this._scheduleScan();
-      }
-    }
-
-    // Native BetterDiscord lifecycle hook: fired whenever the user switches channels/servers/views.
-    onSwitch() {
-      if (!this._running) return;
-      this._scheduleScan();
-    }
-
-    stop() {
-      this._running = false;
-
-      if (this._scanTimer) {
-        clearTimeout(this._scanTimer);
-        this._scanTimer = null;
-      }
-      if (this._rescanInterval) {
-        clearInterval(this._rescanInterval);
-        this._rescanInterval = null;
-      }
-
-      document.removeEventListener("pointerdown", this._onDocPointerDown, true);
-      document.removeEventListener("mousedown", this._onDocPointerDown, true);
-      window.removeEventListener("keydown", this._onKeyDown, true);
-
-      for (const controller of this._controllers.values()) {
-        controller.destroy();
-      }
-      this._controllers.clear();
-      this._sessionMemory.clear();
-
-      this._removeStyles();
-    }
-
-    getSettingsPanel() {
-      if (typeof BdApi !== "undefined" && BdApi.UI && typeof BdApi.UI.buildSettingsPanel === "function") {
-        return BdApi.UI.buildSettingsPanel({
-          settings: [
-            {
-              type: "dropdown",
-              id: "buttonPosition",
-              name: "Overlay Button Position",
-              note: "Which corner of the stream player shows the Crop button on hover.",
-              value: this.settings.buttonPosition,
-              options: [
-                { label: "Top Right", value: "top-right" },
-                { label: "Top Left", value: "top-left" }
-              ]
-            },
-            {
-              type: "dropdown",
-              id: "defaultSliceAspect",
-              name: "Left / Center / Right Target Aspect Ratio",
-              note: "Aspect ratio carved out when clicking Left, Center, or Right on an ultrawide stream.",
-              value: this.settings.defaultSliceAspect,
-              options: [
-                { label: "16:9 Standard Monitor", value: "16:9" },
-                { label: "21:9 Ultrawide", value: "21:9" },
-                { label: "4:3 Classic", value: "4:3" }
-              ]
-            },
-            {
-              type: "switch",
-              id: "rememberPerStreamer",
-              name: "Remember Crop Per Streamer",
-              note: "Restores your last crop automatically if you click off someone's stream and click back.",
-              value: Boolean(this.settings.rememberPerStreamer)
-            },
-            {
-              type: "switch",
-              id: "autoCenterUltrawide",
-              name: "Auto-Center Ultrawide Streams (21:9 / 32:9)",
-              note: "Automatically start in Center crop whenever an ultrawide screen share opens.",
-              value: Boolean(this.settings.autoCenterUltrawide)
-            },
-            {
-              type: "switch",
-              id: "showResolutionBadge",
-              name: "Show Cropped Resolution on Pill",
-              note: "Shows the active output dimensions (e.g. 2560×1440) next to the Crop button.",
-              value: Boolean(this.settings.showResolutionBadge)
-            }
-          ],
-          onChange: (_category, id, value) => {
-            this.settings[id] = value;
-            this._saveData();
-            this._notifySettingsChanged();
-          }
-        });
-      }
-
-      return this._buildFallbackSettingsPanel();
-    }
-
-    _buildFallbackSettingsPanel() {
-      const panel = document.createElement("div");
-      panel.className = "dsc-settings-panel";
-
-      panel.appendChild(
-        this._makeSelectRow(
-          "Overlay Button Position",
-          "Which corner of the stream player shows the Crop button on hover.",
-          [
-            { value: "top-right", label: "Top Right" },
-            { value: "top-left", label: "Top Left" }
-          ],
-          this.settings.buttonPosition,
-          (val) => {
-            this.settings.buttonPosition = val;
-            this._saveData();
-            this._notifySettingsChanged();
-          }
-        )
-      );
-
-      panel.appendChild(
-        this._makeSelectRow(
-          "Left / Center / Right Target Aspect Ratio",
-          "Aspect ratio carved out when clicking Left, Center, or Right on an ultrawide stream.",
-          [
-            { value: "16:9", label: "16:9 Standard Monitor" },
-            { value: "21:9", label: "21:9 Ultrawide" },
-            { value: "4:3", label: "4:3 Classic" }
-          ],
-          this.settings.defaultSliceAspect,
-          (val) => {
-            this.settings.defaultSliceAspect = val;
-            this._saveData();
-          }
-        )
-      );
-
-      panel.appendChild(
-        this._makeToggleRow(
-          "Remember Crop Per Streamer",
-          "Restores your last crop automatically if you click off someone's stream and click back.",
-          this.settings.rememberPerStreamer,
-          (checked) => {
-            this.settings.rememberPerStreamer = checked;
-            this._saveData();
-          }
-        )
-      );
-
-      panel.appendChild(
-        this._makeToggleRow(
-          "Auto-Center Ultrawide Streams (21:9 / 32:9)",
-          "Automatically start in Center crop whenever an ultrawide screen share opens.",
-          this.settings.autoCenterUltrawide,
-          (checked) => {
-            this.settings.autoCenterUltrawide = checked;
-            this._saveData();
-          }
-        )
-      );
-
-      panel.appendChild(
-        this._makeToggleRow(
-          "Show Cropped Resolution on Pill",
-          "Shows the active output dimensions (e.g. 2560×1440) next to the Crop button.",
-          this.settings.showResolutionBadge,
-          (checked) => {
-            this.settings.showResolutionBadge = checked;
-            this._saveData();
-            this._notifySettingsChanged();
-          }
-        )
-      );
-
-      return panel;
-    }
-
-    _makeSelectRow(title, desc, options, currentVal, onChange) {
-      const row = document.createElement("div");
-      row.className = "dsc-setting-row";
-
-      const info = document.createElement("div");
-      info.className = "dsc-setting-info";
-      const titleEl = document.createElement("div");
-      titleEl.className = "dsc-setting-title";
-      titleEl.textContent = title;
-      const descEl = document.createElement("div");
-      descEl.className = "dsc-setting-desc";
-      descEl.textContent = desc;
-      info.appendChild(titleEl);
-      info.appendChild(descEl);
-
-      const select = document.createElement("select");
-      select.className = "dsc-setting-select";
-      for (const opt of options) {
-        const optionEl = document.createElement("option");
-        optionEl.value = opt.value;
-        optionEl.textContent = opt.label;
-        if (opt.value === currentVal) optionEl.selected = true;
-        select.appendChild(optionEl);
-      }
-      select.addEventListener("change", () => onChange(select.value));
-
-      row.appendChild(info);
-      row.appendChild(select);
-      return row;
-    }
-
-    _makeToggleRow(title, desc, currentVal, onChange) {
-      const row = document.createElement("div");
-      row.className = "dsc-setting-row";
-
-      const info = document.createElement("div");
-      info.className = "dsc-setting-info";
-      const titleEl = document.createElement("div");
-      titleEl.className = "dsc-setting-title";
-      titleEl.textContent = title;
-      const descEl = document.createElement("div");
-      descEl.className = "dsc-setting-desc";
-      descEl.textContent = desc;
-      info.appendChild(titleEl);
-      info.appendChild(descEl);
-
-      const checkbox = document.createElement("input");
-      checkbox.type = "checkbox";
-      checkbox.className = "dsc-setting-checkbox";
-      checkbox.checked = Boolean(currentVal);
-      checkbox.addEventListener("change", () => onChange(checkbox.checked));
-
-      row.appendChild(info);
-      row.appendChild(checkbox);
-      return row;
-    }
-
-    _injectStyles() {
-      if (this.api && this.api.DOM && typeof this.api.DOM.addStyle === "function") {
-        this.api.DOM.addStyle(STYLES);
-        return;
-      }
-      if (typeof BdApi !== "undefined" && BdApi.DOM && typeof BdApi.DOM.addStyle === "function") {
-        BdApi.DOM.addStyle(STYLE_ID, STYLES);
-        return;
-      }
-      let styleEl = document.getElementById(STYLE_ID);
-      if (!styleEl) {
-        styleEl = document.createElement("style");
-        styleEl.id = STYLE_ID;
-        (document.head || document.documentElement).appendChild(styleEl);
-      }
-      styleEl.textContent = STYLES;
-    }
-
-    _removeStyles() {
-      if (this.api && this.api.DOM && typeof this.api.DOM.removeStyle === "function") {
-        this.api.DOM.removeStyle();
-      } else if (typeof BdApi !== "undefined" && BdApi.DOM && typeof BdApi.DOM.removeStyle === "function") {
-        BdApi.DOM.removeStyle(STYLE_ID);
-      }
-      const styleEl = document.getElementById(STYLE_ID);
-      if (styleEl) styleEl.remove();
-    }
-
-    _loadData() {
-      try {
-        if (this.api && this.api.Data && typeof this.api.Data.load === "function") {
-          const data = this.api.Data.load("config");
-          if (data && typeof data === "object") return data;
-        }
-        if (typeof BdApi !== "undefined" && BdApi.Data && typeof BdApi.Data.load === "function") {
-          const data = BdApi.Data.load(PLUGIN_NAME, "config");
-          if (data && typeof data === "object") return data;
-        }
-        if (typeof localStorage !== "undefined") {
-          const raw = localStorage.getItem(STORAGE_KEY);
-          if (raw) {
-            const parsed = JSON.parse(raw);
-            if (parsed && typeof parsed === "object") return parsed;
-          }
-        }
-      } catch (_e) {}
-      return {};
-    }
-
-    _saveData() {
-      const payload = {
-        settings: this.settings,
-        presets: this.savedPresets.slice(0, MAX_SAVED_PRESETS),
-        rememberedCrops: this.rememberedCrops.slice(0, MAX_REMEMBERED_STREAMS)
+      this.settings = {
+        buttonPosition: rawSettings.buttonPosition === "top-left" ? "top-left" : DEFAULT_SETTINGS.buttonPosition,
+        rememberPerStreamer: typeof rawSettings.rememberPerStreamer === "boolean"
+          ? rawSettings.rememberPerStreamer
+          : DEFAULT_SETTINGS.rememberPerStreamer,
+        autoCenterUltrawide: !!rawSettings.autoCenterUltrawide,
+        defaultSliceAspect: Object.hasOwn(ASPECT_RATIOS, rawSettings.defaultSliceAspect)
+          ? rawSettings.defaultSliceAspect
+          : DEFAULT_SETTINGS.defaultSliceAspect,
+        showResolutionBadge: typeof rawSettings.showResolutionBadge === "boolean"
+          ? rawSettings.showResolutionBadge
+          : DEFAULT_SETTINGS.showResolutionBadge
       };
+
+      this.presets = Array.isArray(raw.presets)
+        ? raw.presets
+            .filter((p) => p && typeof p.name === "string" && p.region && typeof p.region === "object")
+            .slice(0, MAX_SAVED_PRESETS)
+            .map((p) => ({ name: p.name.slice(0, 20), region: normalizeRegion(p.region) }))
+        : [];
+
+      this.rememberedCrops = Array.isArray(raw.rememberedCrops)
+        ? raw.rememberedCrops
+            .filter((item) => item && typeof item.key === "string" && item.region && typeof item.region === "object")
+            .slice(0, MAX_REMEMBERED_STREAMS)
+            .map((item) => ({
+              key: item.key,
+              region: normalizeRegion(item.region),
+              preset: typeof item.preset === "string" ? item.preset : "custom",
+              updatedAt: Number(item.updatedAt) || 0
+            }))
+        : [];
+    }
+
+    readRaw() {
       try {
-        if (this.api && this.api.Data && typeof this.api.Data.save === "function") {
-          this.api.Data.save("config", payload);
-        } else if (typeof BdApi !== "undefined" && BdApi.Data && typeof BdApi.Data.save === "function") {
-          BdApi.Data.save(PLUGIN_NAME, "config", payload);
-        }
-        if (typeof localStorage !== "undefined") {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
-        }
-      } catch (_e) {}
-    }
-
-    showToast(message, type = "info") {
-      if (typeof BdApi !== "undefined" && BdApi.UI && typeof BdApi.UI.showToast === "function") {
-        BdApi.UI.showToast(message, { type });
+        const loaded = this.#dataApi?.load("config");
+        return loaded && typeof loaded === "object" ? loaded : {};
+      } catch (err) {
+        logWarn("Failed to read saved plugin config; using defaults.", err);
+        return {};
       }
     }
 
-    attachTooltip(node, text) {
-      if (!node) return null;
-      if (typeof BdApi !== "undefined" && BdApi.UI && typeof BdApi.UI.createTooltip === "function") {
-        try {
-          return BdApi.UI.createTooltip(node, text, { side: "bottom", style: "primary" });
-        } catch (_e) {}
+    save() {
+      try {
+        this.#dataApi?.save("config", {
+          settings: this.settings,
+          presets: this.presets,
+          rememberedCrops: this.rememberedCrops
+        });
+      } catch (err) {
+        logWarn("Failed to save plugin config.", err);
       }
-      node.title = text;
-      return null;
     }
 
-    // Store crop per stream so accidentally clicking another call tile or channel
-    // and coming back puts your crop right back where it was.
-    rememberStreamCrop(identities, region, preset) {
+    updateSetting(id, value) {
+      if (!Object.hasOwn(DEFAULT_SETTINGS, id)) return;
+      this.settings[id] = value;
+      this.save();
+    }
+
+    savePreset(name, region) {
+      const cleanName = String(name ?? "").trim().slice(0, 20);
+      if (!cleanName) return this.presets;
+
+      const entry = { name: cleanName, region: normalizeRegion(region) };
+      const idx = this.presets.findIndex((p) => p.name.toLowerCase() === cleanName.toLowerCase());
+      if (idx >= 0) {
+        this.presets[idx] = entry;
+      } else {
+        if (this.presets.length >= MAX_SAVED_PRESETS) this.presets.shift();
+        this.presets.push(entry);
+      }
+      this.save();
+      return this.presets;
+    }
+
+    deletePreset(index) {
+      if (index < 0 || index >= this.presets.length) return this.presets;
+      this.presets.splice(index, 1);
+      this.save();
+      return this.presets;
+    }
+
+    rememberStream(identities, region, preset = "custom") {
       if (!this.settings.rememberPerStreamer || !identities) return;
 
       const isFull = isFullRegion(region);
       const record = isFull
         ? null
-        : {
-            region: normalizeRegion(region),
-            preset: preset || "custom",
-            updatedAt: Date.now()
-          };
+        : { region: normalizeRegion(region), preset, updatedAt: Date.now() };
 
-      for (const sessionKey of identities.sessionKeys || []) {
-        if (!sessionKey) continue;
-        if (isFull) this._sessionMemory.delete(sessionKey);
-        else this._sessionMemory.set(sessionKey, record);
+      for (const sessionKey of identities.sessionKeys) {
+        if (isFull) this.#sessionMemory.delete(sessionKey);
+        else this.#sessionMemory.set(sessionKey, record);
       }
 
       let dirty = false;
-      for (const key of identities.persistentKeys || []) {
-        if (!key) continue;
-        const idx = this.rememberedCrops.findIndex((item) => item && item.key === key);
+      for (const key of identities.persistentKeys) {
+        const idx = this.rememberedCrops.findIndex((item) => item.key === key);
         if (isFull) {
           if (idx >= 0) {
             this.rememberedCrops.splice(idx, 1);
             dirty = true;
           }
-        } else {
-          if (idx >= 0) this.rememberedCrops.splice(idx, 1);
-          this.rememberedCrops.push({
-            key,
-            region: record.region,
-            preset: record.preset,
-            updatedAt: record.updatedAt
-          });
-          while (this.rememberedCrops.length > MAX_REMEMBERED_STREAMS) {
-            this.rememberedCrops.shift();
-          }
-          dirty = true;
+          continue;
         }
+        if (idx >= 0) this.rememberedCrops.splice(idx, 1);
+        this.rememberedCrops.push({ key, ...record });
+        if (this.rememberedCrops.length > MAX_REMEMBERED_STREAMS) {
+          this.rememberedCrops.shift();
+        }
+        dirty = true;
       }
 
-      if (dirty) this._saveData();
+      if (dirty) this.save();
     }
 
-    recallStreamCrop(identities) {
+    recallStream(identities) {
       if (!this.settings.rememberPerStreamer || !identities) return null;
 
-      for (const sessionKey of identities.sessionKeys || []) {
-        if (sessionKey && this._sessionMemory.has(sessionKey)) {
-          return this._sessionMemory.get(sessionKey);
-        }
+      for (const sessionKey of identities.sessionKeys) {
+        const hit = this.#sessionMemory.get(sessionKey);
+        if (hit) return hit;
       }
 
-      for (const key of identities.persistentKeys || []) {
-        if (!key) continue;
+      for (const key of identities.persistentKeys) {
         for (let i = this.rememberedCrops.length - 1; i >= 0; i--) {
-          const item = this.rememberedCrops[i];
-          if (item && item.key === key && item.region) return item;
+          if (this.rememberedCrops[i].key === key) return this.rememberedCrops[i];
         }
       }
 
       return null;
     }
 
-    _notifySettingsChanged() {
-      for (const controller of this._controllers.values()) {
-        controller.syncUI();
+    clearSession() {
+      this.#sessionMemory.clear();
+    }
+  }
+
+  class StreamCropper {
+    #listeners = null;
+    #scanTimer = null;
+    #rescanInterval = null;
+
+    constructor(meta = {}) {
+      this.meta = meta;
+      const pluginName = meta.name || PLUGIN_NAME;
+      this.api = typeof BdApi === "function"
+        ? new BdApi(pluginName)
+        : {
+            DOM: {
+              addStyle: (css) => BdApi.DOM.addStyle(STYLE_ID, css),
+              removeStyle: () => BdApi.DOM.removeStyle(STYLE_ID),
+              onRemoved: (node, cb) => BdApi.DOM.onRemoved?.(node, cb)
+            },
+            Data: {
+              load: (key) => BdApi.Data.load(pluginName, key),
+              save: (key, val) => BdApi.Data.save(pluginName, key, val)
+            },
+            UI: BdApi.UI
+          };
+
+      this.store = new CropStore(this.api.Data);
+      this.controllers = new Map();
+      this.running = false;
+    }
+
+    get settings() {
+      return this.store.settings;
+    }
+
+    get savedPresets() {
+      return this.store.presets;
+    }
+
+    start() {
+      if (this.running) return;
+      this.running = true;
+
+      this.api.DOM.addStyle(STYLES);
+      this.scan();
+
+      this.#listeners = new AbortController();
+      const { signal } = this.#listeners;
+
+      const onOutsidePointer = (event) => {
+        for (const controller of this.controllers.values()) {
+          controller.handleOutsidePointer(event);
+        }
+      };
+
+      document.addEventListener("pointerdown", onOutsidePointer, { capture: true, signal });
+      document.addEventListener("mousedown", onOutsidePointer, { capture: true, signal });
+      window.addEventListener(
+        "keydown",
+        (event) => {
+          if (event.key !== "Escape") return;
+          for (const controller of this.controllers.values()) {
+            if (controller.isDrawing) {
+              event.stopPropagation();
+              event.preventDefault();
+              controller.closeDrawModal();
+            } else if (controller.isOpen) {
+              controller.closeHud();
+            }
+          }
+        },
+        { capture: true, signal }
+      );
+
+      // Discord assigns `video.srcObject` asynchronously after mounting `<video>`,
+      // which does not emit a DOM mutation record.
+      this.#rescanInterval = setInterval(() => {
+        if (this.running) this.scan();
+      }, 1500);
+    }
+
+    observer(mutation) {
+      if (!this.running) return;
+      if (mutation?.addedNodes?.length || mutation?.removedNodes?.length) {
+        this.scheduleScan();
       }
+    }
+
+    onSwitch() {
+      if (this.running) this.scheduleScan();
+    }
+
+    stop() {
+      this.running = false;
+
+      clearTimeout(this.#scanTimer);
+      this.#scanTimer = null;
+
+      clearInterval(this.#rescanInterval);
+      this.#rescanInterval = null;
+
+      this.#listeners?.abort();
+      this.#listeners = null;
+
+      for (const controller of this.controllers.values()) {
+        controller.destroy();
+      }
+      this.controllers.clear();
+      this.store.clearSession();
+
+      this.api.DOM.removeStyle();
+    }
+
+    getSettingsPanel() {
+      return this.api.UI.buildSettingsPanel({
+        settings: [
+          {
+            type: "dropdown",
+            id: "buttonPosition",
+            name: "Overlay Button Position",
+            note: "Which corner of the stream player shows the Crop button on hover.",
+            value: this.settings.buttonPosition,
+            options: [
+              { label: "Top Right", value: "top-right" },
+              { label: "Top Left", value: "top-left" }
+            ]
+          },
+          {
+            type: "dropdown",
+            id: "defaultSliceAspect",
+            name: "Left / Center / Right Target Aspect Ratio",
+            note: "Aspect ratio carved out when clicking Left, Center, or Right on an ultrawide stream.",
+            value: this.settings.defaultSliceAspect,
+            options: [
+              { label: "16:9 Standard Monitor", value: "16:9" },
+              { label: "21:9 Ultrawide", value: "21:9" },
+              { label: "4:3 Classic", value: "4:3" }
+            ]
+          },
+          {
+            type: "switch",
+            id: "rememberPerStreamer",
+            name: "Remember Crop Per Streamer",
+            note: "Restores your last crop automatically if you click off someone's stream and click back.",
+            value: this.settings.rememberPerStreamer
+          },
+          {
+            type: "switch",
+            id: "autoCenterUltrawide",
+            name: "Auto-Center Ultrawide Streams (21:9 / 32:9)",
+            note: "Automatically start in Center crop whenever an ultrawide screen share opens.",
+            value: this.settings.autoCenterUltrawide
+          },
+          {
+            type: "switch",
+            id: "showResolutionBadge",
+            name: "Show Cropped Resolution on Pill",
+            note: "Shows the active output dimensions (e.g. 2560×1440) next to the Crop button.",
+            value: this.settings.showResolutionBadge
+          }
+        ],
+        onChange: (_category, id, value) => {
+          this.store.updateSetting(id, value);
+          for (const controller of this.controllers.values()) {
+            controller.syncUI();
+          }
+        }
+      });
+    }
+
+    showToast(message, type = "info") {
+      this.api.UI?.showToast?.(message, { type });
+    }
+
+    attachTooltip(node, text) {
+      if (!node) return null;
+      if (this.api.UI?.createTooltip) {
+        try {
+          return this.api.UI.createTooltip(node, text, { side: "bottom", style: "primary" });
+        } catch (err) {
+          logWarn("Failed to attach BetterDiscord tooltip; falling back to title attribute.", err);
+        }
+      }
+      node.title = text;
+      return null;
+    }
+
+    rememberStreamCrop(identities, region, preset) {
+      this.store.rememberStream(identities, region, preset);
+    }
+
+    recallStreamCrop(identities) {
+      return this.store.recallStream(identities);
     }
 
     savePreset(name, region) {
-      const cleanName = String(name || "").trim().slice(0, 20);
-      if (!cleanName) return this.savedPresets;
-      const norm = normalizeRegion(region);
-      const idx = this.savedPresets.findIndex((p) => p.name.toLowerCase() === cleanName.toLowerCase());
-      if (idx >= 0) {
-        this.savedPresets[idx] = { name: cleanName, region: norm };
-      } else {
-        if (this.savedPresets.length >= MAX_SAVED_PRESETS) this.savedPresets.shift();
-        this.savedPresets.push({ name: cleanName, region: norm });
-      }
-      this._saveData();
-      for (const controller of this._controllers.values()) {
+      const presets = this.store.savePreset(name, region);
+      for (const controller of this.controllers.values()) {
         controller.renderSavedPresets();
       }
-      return this.savedPresets;
+      return presets;
     }
 
     deletePreset(index) {
-      if (index >= 0 && index < this.savedPresets.length) {
-        this.savedPresets.splice(index, 1);
-        this._saveData();
-        for (const controller of this._controllers.values()) {
-          controller.renderSavedPresets();
-        }
+      const presets = this.store.deletePreset(index);
+      for (const controller of this.controllers.values()) {
+        controller.renderSavedPresets();
       }
-      return this.savedPresets;
+      return presets;
     }
 
-    _scheduleScan() {
-      if (!this._running || this._scanTimer) return;
-      this._scanTimer = setTimeout(() => {
-        this._scanTimer = null;
-        if (this._running) this.scan();
+    scheduleScan() {
+      if (!this.running || this.#scanTimer) return;
+      this.#scanTimer = setTimeout(() => {
+        this.#scanTimer = null;
+        if (this.running) this.scan();
       }, 120);
-    }
-
-    _handleDocPointerDown(event) {
-      for (const controller of this._controllers.values()) {
-        controller.handleOutsidePointer(event);
-      }
-    }
-
-    _handleKeyDown(event) {
-      if (event.key !== "Escape") return;
-      for (const controller of this._controllers.values()) {
-        if (controller.isDrawing) {
-          event.stopPropagation();
-          event.preventDefault();
-          controller.closeDrawModal();
-        } else if (controller.isOpen) {
-          controller.closeHud();
-        }
-      }
     }
 
     isEligibleStreamVideo(video) {
       if (!video || video.nodeName !== "VIDEO" || !video.isConnected) return false;
-      if (video.dataset && video.dataset.dscInternal === "true") return false;
+      if (video.dataset.dscInternal === "true") return false;
+      if (!(video.srcObject instanceof MediaStream)) return false;
 
-      // Active WebRTC streams always populate `video.srcObject` with a MediaStream,
-      // whereas GIFv / Tenor / animated avatars use `src` URLs.
-      const stream = video.srcObject;
-      if (typeof MediaStream === "undefined" || !(stream instanceof MediaStream)) {
-        return false;
-      }
-
-      const rect = video.getBoundingClientRect ? video.getBoundingClientRect() : null;
-      const width = video.clientWidth || (rect ? rect.width : 0);
-      const height = video.clientHeight || (rect ? rect.height : 0);
+      const rect = video.getBoundingClientRect();
+      const width = video.clientWidth || rect.width;
+      const height = video.clientHeight || rect.height;
 
       return width > MIN_STAGE_VIDEO_WIDTH && height > MIN_STAGE_VIDEO_HEIGHT;
     }
 
     scan() {
-      if (!this._running || typeof document === "undefined") return;
+      if (!this.running) return;
 
-      for (const [video, controller] of this._controllers.entries()) {
+      for (const [video, controller] of this.controllers) {
         if (!video.isConnected || !this.isEligibleStreamVideo(video)) {
           controller.destroy();
-          this._controllers.delete(video);
+          this.controllers.delete(video);
         } else {
           controller.ensureMounted();
         }
       }
 
-      const videos = document.querySelectorAll("video");
-      for (const video of videos) {
-        if (!this._controllers.has(video) && this.isEligibleStreamVideo(video)) {
+      for (const video of document.querySelectorAll("video")) {
+        if (!this.controllers.has(video) && this.isEligibleStreamVideo(video)) {
           const controller = new VideoSourceController(video, this);
           controller.mount();
-          this._controllers.set(video, controller);
+          this.controllers.set(video, controller);
         }
       }
     }
