@@ -211,6 +211,15 @@ function createMockDOM({ withWebCodecs = true } = {}) {
       if (k === "id") this.id = String(v);
       if (k === "class") this.className = String(v);
     }
+    getAttribute(k) {
+      return this.attributes.has(k) ? this.attributes.get(k) : null;
+    }
+    append(...nodes) {
+      for (const n of nodes) {
+        if (n && typeof n === "object") this.appendChild(n);
+      }
+    }
+    focus() {}
     appendChild(child) {
       if (child.parentElement) child.parentElement.removeChild(child);
       child.parentElement = this;
@@ -400,7 +409,11 @@ function createMockDOM({ withWebCodecs = true } = {}) {
     }),
     setTimeout,
     clearTimeout,
-    setInterval,
+    setInterval: (fn, ms) => {
+      const t = setInterval(fn, ms);
+      t.unref?.();
+      return t;
+    },
     clearInterval
   });
 
@@ -484,7 +497,11 @@ function loadPlugin({ asBetterDiscord = true, withWebCodecs = true, existingEnv 
     localStorage: env.localStorage,
     setTimeout,
     clearTimeout,
-    setInterval,
+    setInterval: (fn, ms) => {
+      const t = setInterval(fn, ms);
+      t.unref?.();
+      return t;
+    },
     clearInterval,
     console,
     ...env.webCodecsGlobals,

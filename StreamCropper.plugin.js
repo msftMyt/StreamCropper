@@ -384,34 +384,57 @@
     .dsc-saved-pill {
       display: inline-flex;
       align-items: center;
-      gap: 4px;
       height: 22px;
-      padding: 0 8px;
       border-radius: 999px;
       border: 1px solid rgba(255, 255, 255, 0.08);
       background: rgba(43, 45, 49, 0.68);
-      color: #dbdee1;
-      font-size: 10.5px;
-      font-weight: 600;
-      cursor: pointer;
+      overflow: hidden;
     }
 
-    .dsc-saved-pill:hover {
+    .dsc-saved-apply,
+    .dsc-saved-del {
+      border: none;
+      background: transparent;
+      color: #dbdee1;
+      font-family: inherit;
+      cursor: pointer;
+      height: 100%;
+      display: inline-flex;
+      align-items: center;
+    }
+
+    .dsc-saved-apply {
+      padding: 0 6px 0 8px;
+      font-size: 10.5px;
+      font-weight: 600;
+    }
+
+    .dsc-saved-apply:hover,
+    .dsc-saved-apply:focus-visible {
       background: rgba(88, 101, 242, 0.35);
-      border-color: rgba(88, 101, 242, 0.7);
       color: #ffffff;
+      outline: none;
     }
 
     .dsc-saved-del {
+      padding: 0 7px 0 4px;
       opacity: 0.65;
       font-size: 12px;
       line-height: 1;
-      padding-left: 2px;
     }
 
-    .dsc-saved-del:hover {
+    .dsc-saved-del:hover,
+    .dsc-saved-del:focus-visible {
       opacity: 1;
       color: #ff7b7f;
+      outline: none;
+    }
+
+    .dsc-icon-btn:focus-visible,
+    .dsc-chip:focus-visible,
+    .dsc-minimap:focus-visible {
+      outline: 2px solid #5865f2;
+      outline-offset: 1px;
     }
 
     .dsc-draw-modal {
@@ -1176,28 +1199,39 @@
     }
   }
 
-  class VideoSourceController {
-    constructor(video, manager) {
-      this.video = video;
-      this.manager = manager;
+  // Stop clicks, double-clicks, drags, and wheel events on our UI from bubbling
+  // into Discord's player (where double-click toggles fullscreen).
+  function shieldPlayerEvents(el, signal) {
+    const events = ["click", "dblclick", "mousedown", "mouseup", "pointerdown", "pointerup", "contextmenu", "wheel"];
+    for (const type of events) {
+      el.addEventListener(
+        type,
+        (e) => {
+          e.stopPropagation();
+          if (type === "dblclick") e.preventDefault();
+        },
+        { passive: type !== "wheel", signal }
+      );
+    }
+  }
 
-      this.originalStream = video.srcObject;
-      this._nativeSrcDesc = null;
-      this.cropSession = null;
+  // Renders the floating Crop pill, live source minimap HUD, and full-frame custom
+  // draw modal. Communicates user intent back to `VideoSourceController` via methods.
+  class StreamCropOverlay {
+    #controller;
+    #listeners = new AbortController();
+    #modalAbort = null;
+    #minimapRaf = 0;
+    #lastMinimapTs = 0;
+    #drawModalRaf = 0;
+    #tooltips = [];
+    #presetBtns = new Map();
 
-      // Secondary muted <video> attached to the uncropped `originalStream` so our
-      // minimap and Draw Custom Region modal still show the full monitor even
-      // after `this.video.srcObject` has been swapped to the cropped stream.
-      this.sourceMonitorVideo = null;
-
-      this.region = { ...FULL_REGION };
-      this.activePreset = "full";
+    constructor(controller) {
+      this.#controller = controller;
       this.isOpen = false;
       this.isDrawing = false;
-      this._didAutoCrop = false;
 
-      this.host = null;
-      this.promotedHostPos = false;
       this.rootEl = null;
       this.triggerBtn = null;
       this.triggerResSpan = null;
@@ -1208,569 +1242,45 @@
       this.minimapBox = null;
       this.savedRowEl = null;
       this.drawModalEl = null;
-      this.drawModalRaf = null;
-      this._tooltips = [];
-      this._presetBtns = new Map();
-
-      this._minimapRaf = null;
-      this._lastMinimapTs = 0;
-      this._hoverTimer = null;
-
-      this._onHostEnter = () => this._setHover(true);
-      this._onHostMove = () => this._bumpHover();
-      this._onHostLeave = () => this._setHover(false);
-      this._onVideoResize = () => this._handleStreamMetadata();
     }
 
-    // Climb out of the inner `<video>` flex box so the `Crop` button sits in the
-    // top corner of the full stream stage, but stop before climbing into the outer
-    // call container that also wraps the participant avatar row at the bottom.
-    _resolveHostContainer() {
-      const immediate = this.video.parentElement;
-      if (!immediate) return null;
+    build() {
+      const { signal } = this.#listeners;
+      const manager = this.#controller.manager;
 
-      let best = immediate;
-      let cur = immediate;
-
-      for (let depth = 0; depth < 8 && cur && cur !== document.body && cur !== document.documentElement; depth++) {
-        if (cur.querySelectorAll && cur.querySelectorAll("video").length > 1) {
-          break;
-        }
-
-        if (cur !== immediate && cur.children && cur.children.length > 1) {
-          let hasParticipantRow = false;
-          for (const child of cur.children) {
-            if (child.contains && child.contains(this.video)) continue;
-            const cr = child.getBoundingClientRect ? child.getBoundingClientRect() : null;
-            const cw = child.clientWidth || (cr ? cr.width : 0);
-            const ch = child.clientHeight || (cr ? cr.height : 0);
-            if (cw > 300 && ch >= 95) {
-              hasParticipantRow = true;
-              break;
-            }
-          }
-          if (hasParticipantRow) break;
-        }
-
-        const rect = cur.getBoundingClientRect ? cur.getBoundingClientRect() : null;
-        const w = cur.clientWidth || (rect ? rect.width : 0);
-        const h = cur.clientHeight || (rect ? rect.height : 0);
-        if (w >= MIN_STAGE_VIDEO_WIDTH && h >= MIN_STAGE_VIDEO_HEIGHT) {
-          best = cur;
-        }
-
-        cur = cur.parentElement;
-      }
-
-      return best;
-    }
-
-    mount() {
-      const host = this._resolveHostContainer();
-      if (!host) return;
-      this.host = host;
-
-      const computed = typeof window.getComputedStyle === "function" ? window.getComputedStyle(host) : null;
-      const pos = computed ? computed.position : host.style.position;
-      if (!pos || pos === "static") {
-        host.classList.add("dsc-host-positioned");
-        this.promotedHostPos = true;
-      }
-
-      this._installVideoSrcHook();
-      this._buildUI();
-      host.appendChild(this.rootEl);
-
-      // If React purges custom child nodes inside `host` while keeping the stream
-      // alive, re-append our overlay immediately via BetterDiscord's DOM helper.
-      this._offRemoved = null;
-      this._watchOverlayRemoval();
-
-      host.addEventListener("mouseenter", this._onHostEnter);
-      host.addEventListener("mousemove", this._onHostMove, { passive: true });
-      host.addEventListener("mouseleave", this._onHostLeave);
-      this.video.addEventListener("loadedmetadata", this._onVideoResize);
-      this.video.addEventListener("resize", this._onVideoResize);
-
-      this._handleStreamMetadata();
-      this.syncUI();
-    }
-
-    _setNativeSrcObject(stream) {
-      if (this._nativeSrcDesc && typeof this._nativeSrcDesc.set === "function") {
-        this._nativeSrcDesc.set.call(this.video, stream);
-      } else {
-        this.video.srcObject = stream;
-      }
-    }
-
-    _getNativeSrcObject() {
-      if (this._nativeSrcDesc && typeof this._nativeSrcDesc.get === "function") {
-        return this._nativeSrcDesc.get.call(this.video);
-      }
-      return this.video.srcObject;
-    }
-
-    // Discord's React tree periodically re-renders the player and re-runs
-    // `video.srcObject = originalStream`. We shadow `srcObject` on this single
-    // `<video>` instance (never on HTMLMediaElement.prototype) so React re-renders
-    // don't clobber an active crop, while genuine stream switches are caught cleanly.
-    _installVideoSrcHook() {
-      this._removeVideoSrcHook();
-
-      let desc = null;
-      let proto = Object.getPrototypeOf(this.video);
-      while (proto && !desc) {
-        desc = Object.getOwnPropertyDescriptor(proto, "srcObject");
-        proto = Object.getPrototypeOf(proto);
-      }
-      if (!desc || typeof desc.get !== "function" || typeof desc.set !== "function") {
-        return;
-      }
-
-      this._nativeSrcDesc = desc;
-      const controller = this;
-
-      Object.defineProperty(this.video, "srcObject", {
-        configurable: true,
-        enumerable: desc.enumerable,
-        get() {
-          return desc.get.call(this);
-        },
-        set(incomingStream) {
-          if (incomingStream && CROPPED_STREAMS.has(incomingStream)) {
-            desc.set.call(this, incomingStream);
-            return;
-          }
-
-          if (!incomingStream) {
-            controller._teardownCropSession(false);
-            controller.originalStream = null;
-            desc.set.call(this, null);
-            return;
-          }
-
-          // React re-assigned the exact same stream we're already cropping — keep our cropped output alive.
-          if (controller.originalStream && incomingStream === controller.originalStream) {
-            if (controller.cropSession && controller.cropSession.outputStream) {
-              desc.set.call(this, controller.cropSession.outputStream);
-              return;
-            }
-            desc.set.call(this, incomingStream);
-            return;
-          }
-
-          // User switched to watching a different stream on the same `<video>` element.
-          controller.originalStream = incomingStream;
-          controller._didAutoCrop = false;
-          if (controller.sourceMonitorVideo) {
-            controller.sourceMonitorVideo.srcObject = incomingStream;
-          }
-
-          const recalled = controller.manager.recallStreamCrop(controller._getStreamIdentities());
-          if (recalled && recalled.region && !isFullRegion(recalled.region)) {
-            controller.region = normalizeRegion(recalled.region);
-            controller.activePreset = recalled.preset || "custom";
-            controller._didAutoCrop = true;
-            controller._rebuildCropSession();
-            controller.syncUI();
-            return;
-          }
-
-          // Don't carry someone's ultrawide crop over onto a different streamer's 16:9 feed.
-          controller._teardownCropSession(false);
-          controller.region = { ...FULL_REGION };
-          controller.activePreset = "full";
-          desc.set.call(this, incomingStream);
-          controller._handleStreamMetadata();
-          controller.syncUI();
-        }
-      });
-    }
-
-    _removeVideoSrcHook() {
-      if (!this._nativeSrcDesc) return;
-      try {
-        delete this.video.srcObject;
-      } catch (_e) {}
-      this._nativeSrcDesc = null;
-    }
-
-    ensureMounted() {
-      if (!this.host || !this.host.isConnected) return;
-      if (this.rootEl && !this.rootEl.isConnected) {
-        this.host.appendChild(this.rootEl);
-      }
-
-      const current = this._getNativeSrcObject();
-      if (current && !CROPPED_STREAMS.has(current) && current !== this.originalStream) {
-        this.originalStream = current;
-        this._didAutoCrop = false;
-        if (this.sourceMonitorVideo) {
-          this.sourceMonitorVideo.srcObject = current;
-        }
-        const recalled = this.manager.recallStreamCrop(this._getStreamIdentities());
-        if (recalled && recalled.region && !isFullRegion(recalled.region)) {
-          this.region = normalizeRegion(recalled.region);
-          this.activePreset = recalled.preset || "custom";
-          this._didAutoCrop = true;
-          this._rebuildCropSession();
-          this.syncUI();
-          return;
-        }
-        this._teardownCropSession(false);
-        this.region = { ...FULL_REGION };
-        this.activePreset = "full";
-        this._handleStreamMetadata();
-        this.syncUI();
-      }
-    }
-
-    _watchOverlayRemoval() {
-      if (this._offRemoved) {
-        try {
-          this._offRemoved();
-        } catch (_e) {}
-        this._offRemoved = null;
-      }
-      if (!this.rootEl || typeof BdApi === "undefined" || !BdApi.DOM || typeof BdApi.DOM.onRemoved !== "function") {
-        return;
-      }
-      this._offRemoved = BdApi.DOM.onRemoved(this.rootEl, () => {
-        if (this.host && this.host.isConnected && this.video.isConnected && this.rootEl) {
-          this.host.appendChild(this.rootEl);
-          this._watchOverlayRemoval();
-        }
-      });
-    }
-
-    destroy() {
-      this.closeDrawModal();
-      this._stopMinimapLoop();
-
-      if (this._offRemoved) {
-        try {
-          this._offRemoved();
-        } catch (_e) {}
-        this._offRemoved = null;
-      }
-
-      if (this._hoverTimer) {
-        clearTimeout(this._hoverTimer);
-        this._hoverTimer = null;
-      }
-
-      this._removeVideoSrcHook();
-      this._teardownCropSession(true);
-      this._destroySourceMonitor();
-
-      if (this.host) {
-        this.host.removeEventListener("mouseenter", this._onHostEnter);
-        this.host.removeEventListener("mousemove", this._onHostMove);
-        this.host.removeEventListener("mouseleave", this._onHostLeave);
-        this.host.classList.remove("dsc-host-hover");
-        if (this.promotedHostPos) {
-          this.host.classList.remove("dsc-host-positioned");
-          this.promotedHostPos = false;
-        }
-      }
-
-      this.video.removeEventListener("loadedmetadata", this._onVideoResize);
-      this.video.removeEventListener("resize", this._onVideoResize);
-
-      if (this._tooltips.length) {
-        for (const tip of this._tooltips) {
-          try {
-            if (tip && typeof tip.destroy === "function") tip.destroy();
-            else if (tip && typeof tip.hide === "function") tip.hide();
-          } catch (_e) {}
-        }
-        this._tooltips = [];
-      }
-
-      if (this.rootEl) {
-        this.rootEl.remove();
-        this.rootEl = null;
-      }
-      this.host = null;
-    }
-
-    // Grab the streamer's display name from Discord's overlay badge without relying
-    // on hashed Discord class names that break on client updates.
-    _extractStreamerLabel() {
-      if (!this.host || !this.host.querySelectorAll) return "";
-      const nodes = this.host.querySelectorAll("span, div");
-      for (const el of nodes) {
-        if (this.rootEl && this.rootEl.contains(el)) continue;
-        if (el.children && el.children.length > 0) continue;
-        const text = String(el.textContent || "").trim();
-        if (
-          text.length >= 2 &&
-          text.length <= 32 &&
-          !/^(LIVE|HD|FHD|QHD|4K|1080p|720p|1440p|60|30|FPS|\d+[:x×]\d+)$/i.test(text)
-        ) {
-          return text.toLowerCase();
-        }
-      }
-      return "";
-    }
-
-    // Build lookup keys from most specific (live WebRTC stream/track IDs) to
-    // durable across reconnects (streamer badge + resolution, or ultrawide resolution).
-    _getStreamIdentities() {
-      const sessionKeys = [];
-      const persistentKeys = [];
-
-      if (this.originalStream) {
-        if (typeof this.originalStream.id === "string" && this.originalStream.id) {
-          sessionKeys.push(`stream:${this.originalStream.id}`);
-        }
-        const vTracks = this.originalStream.getVideoTracks ? this.originalStream.getVideoTracks() : [];
-        if (vTracks.length && typeof vTracks[0].id === "string" && vTracks[0].id) {
-          sessionKeys.push(`track:${vTracks[0].id}`);
-        }
-      }
-
-      const dims = this._getOriginalDimensions();
-      const hasDims = dims.width > 0 && dims.height > 0;
-      const streamer = this._extractStreamerLabel();
-
-      if (streamer && hasDims) {
-        persistentKeys.push(`streamer:${streamer}|${dims.width}x${dims.height}`);
-      }
-      if (streamer) {
-        persistentKeys.push(`streamer:${streamer}`);
-      }
-      if (hasDims && dims.width / Math.max(1, dims.height) > 2.05) {
-        persistentKeys.push(`ultrawide-res:${dims.width}x${dims.height}`);
-      }
-
-      return { sessionKeys, persistentKeys };
-    }
-
-    _handleStreamMetadata() {
-      const dims = this._getOriginalDimensions();
-      const aspect = dims.width / Math.max(1, dims.height);
-
-      if (!this._didAutoCrop && isFullRegion(this.region)) {
-        const recalled = this.manager.recallStreamCrop(this._getStreamIdentities());
-        if (recalled && recalled.region && !isFullRegion(recalled.region)) {
-          this._didAutoCrop = true;
-          this.region = normalizeRegion(recalled.region);
-          this.activePreset = recalled.preset || "custom";
-          this._applySourceCrop();
-          this.syncUI();
-          return;
-        }
-      }
-
-      if (
-        !this._didAutoCrop &&
-        this.manager.settings.autoCenterUltrawide &&
-        isFullRegion(this.region) &&
-        dims.width > 0 &&
-        aspect > 2.15
-      ) {
-        this._didAutoCrop = true;
-        this.applyPreset("center");
-        return;
-      }
-
-      this.syncUI();
-    }
-
-    _setHover(hovered) {
-      if (!this.host) return;
-      if (hovered) {
-        this.host.classList.add("dsc-host-hover");
-        this._bumpHover();
-      } else {
-        if (this._hoverTimer) {
-          clearTimeout(this._hoverTimer);
-          this._hoverTimer = null;
-        }
-        this.host.classList.remove("dsc-host-hover");
-      }
-    }
-
-    _bumpHover() {
-      if (!this.host) return;
-      this.host.classList.add("dsc-host-hover");
-      if (this._hoverTimer) clearTimeout(this._hoverTimer);
-      this._hoverTimer = setTimeout(() => {
-        if (this.host && !this.isOpen) {
-          this.host.classList.remove("dsc-host-hover");
-        }
-      }, 2200);
-    }
-
-    // Stop clicks, double-clicks, drags, and wheel events on our UI from bubbling
-    // into Discord's player (where double-click toggles fullscreen).
-    _shieldEvents(el) {
-      const events = ["click", "dblclick", "mousedown", "mouseup", "pointerdown", "pointerup", "contextmenu", "wheel"];
-      for (const evt of events) {
-        el.addEventListener(
-          evt,
-          (e) => {
-            e.stopPropagation();
-            if (evt === "dblclick") e.preventDefault();
-          },
-          evt === "wheel" ? { passive: false } : false
-        );
-      }
-    }
-
-    _getOriginalDimensions() {
-      if (this.sourceMonitorVideo && this.sourceMonitorVideo.videoWidth > 0 && this.sourceMonitorVideo.videoHeight > 0) {
-        return {
-          width: this.sourceMonitorVideo.videoWidth,
-          height: this.sourceMonitorVideo.videoHeight
-        };
-      }
-
-      const vTracks =
-        this.originalStream && this.originalStream.getVideoTracks
-          ? this.originalStream.getVideoTracks()
-          : [];
-      if (vTracks.length && typeof vTracks[0].getSettings === "function") {
-        const settings = vTracks[0].getSettings();
-        if (settings && settings.width > 0 && settings.height > 0) {
-          return { width: settings.width, height: settings.height };
-        }
-      }
-
-      if (isFullRegion(this.region) && this.video.videoWidth > 0 && this.video.videoHeight > 0) {
-        return { width: this.video.videoWidth, height: this.video.videoHeight };
-      }
-
-      return {
-        width: this.video.videoWidth || this.video.clientWidth || 1920,
-        height: this.video.videoHeight || this.video.clientHeight || 1080
-      };
-    }
-
-    _ensureSourceMonitor() {
-      if (this.sourceMonitorVideo) {
-        if (this.originalStream && this.sourceMonitorVideo.srcObject !== this.originalStream) {
-          this.sourceMonitorVideo.srcObject = this.originalStream;
-        }
-        return this.sourceMonitorVideo;
-      }
-
-      const monitor = document.createElement("video");
-      monitor.dataset.dscInternal = "true";
-      monitor.muted = true;
-      monitor.autoplay = true;
-      monitor.playsInline = true;
-      if (this.originalStream) {
-        monitor.srcObject = this.originalStream;
-      }
-      if (typeof monitor.play === "function") {
-        const p = monitor.play();
-        if (p && typeof p.catch === "function") p.catch(() => {});
-      }
-      this.sourceMonitorVideo = monitor;
-      return monitor;
-    }
-
-    _destroySourceMonitor() {
-      if (!this.sourceMonitorVideo) return;
-      try {
-        if (typeof this.sourceMonitorVideo.pause === "function") this.sourceMonitorVideo.pause();
-        this.sourceMonitorVideo.srcObject = null;
-      } catch (_e) {}
-      this.sourceMonitorVideo = null;
-    }
-
-    _applySourceCrop() {
-      if (isFullRegion(this.region)) {
-        this._teardownCropSession(true);
-        return;
-      }
-
-      if (!this.originalStream) {
-        const cur = this._getNativeSrcObject();
-        if (cur && !CROPPED_STREAMS.has(cur)) {
-          this.originalStream = cur;
-        }
-      }
-      if (!this.originalStream) return;
-
-      this._ensureSourceMonitor();
-
-      if (this.cropSession && !this.cropSession.disposed && this.cropSession.sourceStream === this.originalStream) {
-        this.cropSession.setRegion(this.region);
-        return;
-      }
-
-      this._rebuildCropSession();
-    }
-
-    _rebuildCropSession() {
-      if (this.cropSession) {
-        this.cropSession.stop();
-        this.cropSession = null;
-      }
-      if (!this.originalStream || isFullRegion(this.region)) return;
-
-      this._ensureSourceMonitor();
-      const session = new MediaStreamCropSession(this.originalStream, this.region, {
-        onStreamReplaced: (fallbackStream) => {
-          if (this.cropSession !== session || !this.video.isConnected) return;
-          this._setNativeSrcObject(fallbackStream);
-          this.video.play()?.catch(() => {});
-        }
-      });
-      const croppedStream = session.start();
-      if (!croppedStream) return;
-
-      this.cropSession = session;
-      this._setNativeSrcObject(croppedStream);
-      this.video.play()?.catch(() => {});
-    }
-
-    _teardownCropSession(restoreOriginal) {
-      const hadSession = !!this.cropSession;
-      if (this.cropSession) {
-        this.cropSession.stop();
-        this.cropSession = null;
-      }
-      if (!this.isOpen && !this.isDrawing) {
-        this._destroySourceMonitor();
-      }
-      if (restoreOriginal && hadSession && this.originalStream && this.video.isConnected) {
-        this._setNativeSrcObject(this.originalStream);
-        this.video.play()?.catch(() => {});
-      }
-    }
-
-    _buildUI() {
       const root = document.createElement("div");
       root.className = "dsc-root";
 
       const trigger = document.createElement("button");
       trigger.type = "button";
       trigger.className = "dsc-trigger";
-      const triggerTip = this.manager.attachTooltip(trigger, "Crop stream source");
-      if (triggerTip) this._tooltips.push(triggerTip);
+      trigger.setAttribute("aria-haspopup", "dialog");
+      trigger.setAttribute("aria-expanded", "false");
+      const tip = manager.attachTooltip(trigger, "Crop stream source");
+      if (tip) this.#tooltips.push(tip);
       trigger.innerHTML = `${ICONS.crop}<span>Crop</span>`;
 
       const resSpan = document.createElement("span");
       resSpan.className = "dsc-trigger-res";
       const dotSpan = document.createElement("span");
       dotSpan.className = "dsc-dot";
-      trigger.appendChild(resSpan);
-      trigger.appendChild(dotSpan);
+      trigger.append(resSpan, dotSpan);
 
-      this._shieldEvents(trigger);
-      trigger.addEventListener("click", (e) => {
-        e.preventDefault();
-        this.toggleHud();
-      });
+      shieldPlayerEvents(trigger, signal);
+      trigger.addEventListener(
+        "click",
+        (e) => {
+          e.preventDefault();
+          this.toggleHud();
+        },
+        { signal }
+      );
 
       const hud = document.createElement("div");
       hud.className = "dsc-hud";
-      this._shieldEvents(hud);
+      hud.setAttribute("role", "dialog");
+      hud.setAttribute("aria-label", "Stream Source Crop");
+      shieldPlayerEvents(hud, signal);
 
       const header = document.createElement("div");
       header.className = "dsc-header";
@@ -1785,9 +1295,7 @@
       const meta = document.createElement("span");
       meta.className = "dsc-meta";
       meta.textContent = "Full Stream";
-
-      titleWrap.appendChild(title);
-      titleWrap.appendChild(meta);
+      titleWrap.append(title, meta);
 
       const headerBtns = document.createElement("div");
       headerBtns.className = "dsc-header-btns";
@@ -1796,20 +1304,20 @@
       resetBtn.type = "button";
       resetBtn.className = "dsc-icon-btn dsc-reset-btn";
       resetBtn.title = "Restore uncropped stream";
+      resetBtn.setAttribute("aria-label", "Reset crop");
       resetBtn.innerHTML = `${ICONS.reset}<span>Reset</span>`;
-      resetBtn.addEventListener("click", () => this.reset());
+      resetBtn.addEventListener("click", () => this.#controller.reset(), { signal });
 
       const closeBtn = document.createElement("button");
       closeBtn.type = "button";
       closeBtn.className = "dsc-icon-btn";
       closeBtn.title = "Close panel";
+      closeBtn.setAttribute("aria-label", "Close crop panel");
       closeBtn.innerHTML = ICONS.close;
-      closeBtn.addEventListener("click", () => this.closeHud());
+      closeBtn.addEventListener("click", () => this.closeHud(), { signal });
 
-      headerBtns.appendChild(resetBtn);
-      headerBtns.appendChild(closeBtn);
-      header.appendChild(titleWrap);
-      header.appendChild(headerBtns);
+      headerBtns.append(resetBtn, closeBtn);
+      header.append(titleWrap, headerBtns);
       hud.appendChild(header);
 
       const chips = document.createElement("div");
@@ -1828,15 +1336,19 @@
         btn.dataset.preset = preset.id;
         btn.textContent = preset.label;
         btn.title = preset.title;
-        btn.addEventListener("click", () => this.applyPreset(preset.id));
-        this._presetBtns.set(preset.id, btn);
+        btn.setAttribute("aria-pressed", "false");
+        btn.addEventListener("click", () => this.#controller.applyPreset(preset.id), { signal });
+        this.#presetBtns.set(preset.id, btn);
         chips.appendChild(btn);
       }
       hud.appendChild(chips);
 
       const minimap = document.createElement("div");
       minimap.className = "dsc-minimap";
-      minimap.title = "Drag box to pan, drag handles to resize, or double-click to reset";
+      minimap.tabIndex = 0;
+      minimap.setAttribute("role", "application");
+      minimap.setAttribute("aria-label", "Crop region selector — use arrow keys to nudge, +/- to zoom, or drag with mouse");
+      minimap.title = "Drag box to pan, drag handles to resize, arrow keys to nudge, or double-click to reset";
 
       const mmCanvas = document.createElement("canvas");
       mmCanvas.className = "dsc-minimap-canvas";
@@ -1852,9 +1364,8 @@
         box.appendChild(handle);
       }
 
-      minimap.appendChild(mmCanvas);
-      minimap.appendChild(box);
-      this._attachMinimapHandlers(minimap, box);
+      minimap.append(mmCanvas, box);
+      this.attachMinimapHandlers(minimap, box, signal);
       hud.appendChild(minimap);
 
       const footer = document.createElement("div");
@@ -1865,37 +1376,39 @@
       drawBtn.className = "dsc-icon-btn dsc-draw-full-btn";
       drawBtn.title = "Draw a custom crop box on the full uncropped frame";
       drawBtn.innerHTML = `${ICONS.draw}<span>Draw Custom Region</span>`;
-      drawBtn.addEventListener("click", () => this.openDrawModal());
+      drawBtn.addEventListener("click", () => this.openDrawModal(), { signal });
 
       const saveBtn = document.createElement("button");
       saveBtn.type = "button";
       saveBtn.className = "dsc-icon-btn dsc-save-btn";
       saveBtn.title = "Save current crop preset";
       saveBtn.innerHTML = `${ICONS.bookmark}<span>Save</span>`;
-      saveBtn.addEventListener("click", () => {
-        if (isFullRegion(this.region)) {
-          this.manager.showToast("Select a crop area before saving a preset", "warning");
-          return;
-        }
-        const count = this.manager.savedPresets.length;
-        const label =
-          this.activePreset !== "custom" && this.activePreset !== "full"
-            ? this.activePreset.toUpperCase()
+      saveBtn.addEventListener(
+        "click",
+        () => {
+          if (isFullRegion(this.#controller.region)) {
+            manager.showToast("Select a crop area before saving a preset", "warning");
+            return;
+          }
+          const count = manager.savedPresets.length;
+          const active = this.#controller.activePreset;
+          const label = active !== "custom" && active !== "full"
+            ? active.toUpperCase()
             : `Crop ${count + 1}`;
-        this.manager.savePreset(label, this.region);
-        this.manager.showToast(`Saved "${label}"`, "success");
-      });
+          manager.savePreset(label, this.#controller.region);
+          manager.showToast(`Saved "${label}"`, "success");
+        },
+        { signal }
+      );
 
-      footer.appendChild(drawBtn);
-      footer.appendChild(saveBtn);
+      footer.append(drawBtn, saveBtn);
       hud.appendChild(footer);
 
       const savedRow = document.createElement("div");
       savedRow.className = "dsc-saved-row";
       hud.appendChild(savedRow);
 
-      root.appendChild(trigger);
-      root.appendChild(hud);
+      root.append(trigger, hud);
 
       this.rootEl = root;
       this.triggerBtn = trigger;
@@ -1908,140 +1421,185 @@
       this.savedRowEl = savedRow;
 
       this.renderSavedPresets();
+      return root;
     }
 
-    _attachMinimapHandlers(minimap, box) {
-      minimap.addEventListener("dblclick", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this.reset();
-      });
+    zoomAroundCenter(factor) {
+      const ctrl = this.#controller;
+      const cx = ctrl.region.x + ctrl.region.w / 2;
+      const cy = ctrl.region.y + ctrl.region.h / 2;
+      let baseW = ctrl.region.w;
+      let baseH = ctrl.region.h;
+
+      if (isFullRegion(ctrl.region) && factor < 1) {
+        const dims = ctrl.getOriginalDimensions();
+        const aspect = dims.width / Math.max(1, dims.height);
+        const target = ASPECT_RATIOS[ctrl.manager.settings.defaultSliceAspect] ?? 16 / 9;
+        baseW = aspect > target ? clamp(target / aspect, 0.25, 0.9) : 0.85;
+        baseH = aspect > target ? 0.9 : 0.85;
+      }
+
+      const nw = clamp(baseW * factor, MIN_CROP_FRACTION, 1);
+      const nh = clamp(baseH * factor, MIN_CROP_FRACTION, 1);
+      if (nw >= 0.995 && nh >= 0.995) {
+        ctrl.reset();
+        return;
+      }
+      ctrl.activePreset = "custom";
+      ctrl.setRegion({ x: cx - nw / 2, y: cy - nh / 2, w: nw, h: nh });
+    }
+
+    attachMinimapHandlers(minimap, box, signal) {
+      const ctrl = this.#controller;
+
+      minimap.addEventListener(
+        "dblclick",
+        (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          ctrl.reset();
+        },
+        { signal }
+      );
 
       minimap.addEventListener(
         "wheel",
         (e) => {
           e.preventDefault();
           e.stopPropagation();
-          const factor = e.deltaY < 0 ? 0.9 : 1.1;
-          const cx = this.region.x + this.region.w / 2;
-          const cy = this.region.y + this.region.h / 2;
-          let baseW = this.region.w;
-          let baseH = this.region.h;
-
-          if (isFullRegion(this.region) && e.deltaY < 0) {
-            const dims = this._getOriginalDimensions();
-            const aspect = dims.width / Math.max(1, dims.height);
-            const target = ASPECT_RATIOS[this.manager.settings.defaultSliceAspect] || 16 / 9;
-            baseW = aspect > target ? clamp(target / aspect, 0.25, 0.9) : 0.85;
-            baseH = aspect > target ? 0.9 : 0.85;
-          }
-
-          const nw = clamp(baseW * factor, MIN_CROP_FRACTION, 1);
-          const nh = clamp(baseH * factor, MIN_CROP_FRACTION, 1);
-          if (nw >= 0.995 && nh >= 0.995) {
-            this.reset();
-            return;
-          }
-          this.activePreset = "custom";
-          this.setRegion({ x: cx - nw / 2, y: cy - nh / 2, w: nw, h: nh });
+          this.zoomAroundCenter(e.deltaY < 0 ? 0.9 : 1.1);
         },
-        { passive: false }
+        { passive: false, signal }
       );
 
-      minimap.addEventListener("mousedown", (e) => {
-        if (e.button !== undefined && e.button !== 0) return;
-        e.preventDefault();
-        e.stopPropagation();
-
-        const rect = minimap.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) return;
-
-        const handleDir = e.target && e.target.dataset ? e.target.dataset.handle : null;
-        const insideBox = box.contains(e.target) && !handleDir;
-
-        const startX = e.clientX;
-        const startY = e.clientY;
-        const startReg = { ...this.region };
-
-        let mode = "create";
-        if (handleDir) {
-          mode = `resize-${handleDir}`;
-        } else if (insideBox && !isFullRegion(this.region)) {
-          mode = "move";
-        }
-
-        const originX = clamp((e.clientX - rect.left) / rect.width, 0, 1);
-        const originY = clamp((e.clientY - rect.top) / rect.height, 0, 1);
-
-        const onMove = (me) => {
-          me.preventDefault();
-          me.stopPropagation();
-
-          const dx = (me.clientX - startX) / rect.width;
-          const dy = (me.clientY - startY) / rect.height;
-
-          if (mode === "move") {
-            this.activePreset = "custom";
-            this.setRegion({
-              x: clamp(startReg.x + dx, 0, 1 - startReg.w),
-              y: clamp(startReg.y + dy, 0, 1 - startReg.h),
-              w: startReg.w,
-              h: startReg.h
+      minimap.addEventListener(
+        "keydown",
+        (e) => {
+          const step = e.shiftKey ? 0.08 : 0.025;
+          const reg = ctrl.region;
+          if (e.key === "+" || e.key === "=") {
+            e.preventDefault();
+            e.stopPropagation();
+            this.zoomAroundCenter(0.9);
+          } else if (e.key === "-" || e.key === "_") {
+            e.preventDefault();
+            e.stopPropagation();
+            this.zoomAroundCenter(1.1);
+          } else if (e.key === "0" || e.key === "Backspace") {
+            e.preventDefault();
+            e.stopPropagation();
+            ctrl.reset();
+          } else if (!isFullRegion(reg) && e.key.startsWith("Arrow")) {
+            e.preventDefault();
+            e.stopPropagation();
+            const dx = e.key === "ArrowRight" ? step : e.key === "ArrowLeft" ? -step : 0;
+            const dy = e.key === "ArrowDown" ? step : e.key === "ArrowUp" ? -step : 0;
+            ctrl.activePreset = "custom";
+            ctrl.setRegion({
+              x: clamp(reg.x + dx, 0, 1 - reg.w),
+              y: clamp(reg.y + dy, 0, 1 - reg.h),
+              w: reg.w,
+              h: reg.h
             });
-            return;
           }
+        },
+        { signal }
+      );
 
-          if (mode === "create") {
-            const curX = clamp((me.clientX - rect.left) / rect.width, 0, 1);
-            const curY = clamp((me.clientY - rect.top) / rect.height, 0, 1);
-            const w = Math.abs(curX - originX);
-            const h = Math.abs(curY - originY);
-            if (w < 0.03 && h < 0.03) return;
-            this.activePreset = "custom";
-            this.setRegion({
-              x: Math.min(originX, curX),
-              y: Math.min(originY, curY),
-              w: Math.max(MIN_CROP_FRACTION, w),
-              h: Math.max(MIN_CROP_FRACTION, h)
-            });
-            return;
-          }
+      minimap.addEventListener(
+        "mousedown",
+        (e) => {
+          if (e.button !== undefined && e.button !== 0) return;
+          e.preventDefault();
+          e.stopPropagation();
 
-          const dir = mode.slice("resize-".length);
-          let left = startReg.x;
-          let right = startReg.x + startReg.w;
-          let top = startReg.y;
-          let bottom = startReg.y + startReg.h;
+          const rect = minimap.getBoundingClientRect();
+          if (rect.width <= 0 || rect.height <= 0) return;
 
-          if (dir.includes("w")) left = clamp(left + dx, 0, right - MIN_CROP_FRACTION);
-          if (dir.includes("e")) right = clamp(right + dx, left + MIN_CROP_FRACTION, 1);
-          if (dir.includes("n")) top = clamp(top + dy, 0, bottom - MIN_CROP_FRACTION);
-          if (dir.includes("s")) bottom = clamp(bottom + dy, top + MIN_CROP_FRACTION, 1);
+          const handleDir = e.target?.dataset?.handle ?? null;
+          const insideBox = box.contains(e.target) && !handleDir;
+          const startX = e.clientX;
+          const startY = e.clientY;
+          const startReg = { ...ctrl.region };
 
-          this.activePreset = "custom";
-          this.setRegion({
-            x: left,
-            y: top,
-            w: right - left,
-            h: bottom - top
-          });
-        };
+          const mode = handleDir
+            ? `resize-${handleDir}`
+            : insideBox && !isFullRegion(ctrl.region)
+              ? "move"
+              : "create";
 
-        const onUp = (ue) => {
-          ue.preventDefault();
-          ue.stopPropagation();
-          window.removeEventListener("mousemove", onMove, true);
-          window.removeEventListener("mouseup", onUp, true);
-        };
+          const originX = clamp((e.clientX - rect.left) / rect.width, 0, 1);
+          const originY = clamp((e.clientY - rect.top) / rect.height, 0, 1);
+          const dragAbort = new AbortController();
 
-        window.addEventListener("mousemove", onMove, true);
-        window.addEventListener("mouseup", onUp, true);
-      });
+          const onMove = (me) => {
+            me.preventDefault();
+            me.stopPropagation();
+
+            const dx = (me.clientX - startX) / rect.width;
+            const dy = (me.clientY - startY) / rect.height;
+
+            if (mode === "move") {
+              ctrl.activePreset = "custom";
+              ctrl.setRegion({
+                x: clamp(startReg.x + dx, 0, 1 - startReg.w),
+                y: clamp(startReg.y + dy, 0, 1 - startReg.h),
+                w: startReg.w,
+                h: startReg.h
+              });
+              return;
+            }
+
+            if (mode === "create") {
+              const curX = clamp((me.clientX - rect.left) / rect.width, 0, 1);
+              const curY = clamp((me.clientY - rect.top) / rect.height, 0, 1);
+              const w = Math.abs(curX - originX);
+              const h = Math.abs(curY - originY);
+              if (w < 0.03 && h < 0.03) return;
+              ctrl.activePreset = "custom";
+              ctrl.setRegion({
+                x: Math.min(originX, curX),
+                y: Math.min(originY, curY),
+                w: Math.max(MIN_CROP_FRACTION, w),
+                h: Math.max(MIN_CROP_FRACTION, h)
+              });
+              return;
+            }
+
+            const dir = mode.slice("resize-".length);
+            let left = startReg.x;
+            let right = startReg.x + startReg.w;
+            let top = startReg.y;
+            let bottom = startReg.y + startReg.h;
+
+            if (dir.includes("w")) left = clamp(left + dx, 0, right - MIN_CROP_FRACTION);
+            if (dir.includes("e")) right = clamp(right + dx, left + MIN_CROP_FRACTION, 1);
+            if (dir.includes("n")) top = clamp(top + dy, 0, bottom - MIN_CROP_FRACTION);
+            if (dir.includes("s")) bottom = clamp(bottom + dy, top + MIN_CROP_FRACTION, 1);
+
+            ctrl.activePreset = "custom";
+            ctrl.setRegion({ x: left, y: top, w: right - left, h: bottom - top });
+          };
+
+          const onUp = (ue) => {
+            ue.preventDefault();
+            ue.stopPropagation();
+            dragAbort.abort();
+          };
+
+          const dragSignal = AbortSignal.any
+            ? AbortSignal.any([signal, dragAbort.signal])
+            : dragAbort.signal;
+          window.addEventListener("mousemove", onMove, { capture: true, signal: dragSignal });
+          window.addEventListener("mouseup", onUp, { capture: true, signal: dragSignal });
+        },
+        { signal }
+      );
     }
 
-    _updateMinimapSize() {
+    updateMinimapSize() {
       if (!this.minimapEl || !this.minimapCanvas) return;
-      const dims = this._getOriginalDimensions();
+      const dims = this.#controller.getOriginalDimensions();
       const aspect = clamp(dims.width / Math.max(1, dims.height), 0.75, 4.2);
       const w = 312;
       const h = Math.round(clamp(w / aspect, 78, 176));
@@ -2052,44 +1610,41 @@
       }
     }
 
-    _startMinimapLoop() {
-      this._stopMinimapLoop();
-      this._ensureSourceMonitor();
-
-      if (typeof requestAnimationFrame === "undefined") {
-        this._drawMinimap();
-        return;
-      }
+    startMinimapLoop() {
+      this.stopMinimapLoop();
+      this.#controller.ensureSourceMonitor();
 
       const tick = (ts) => {
         if (!this.isOpen) return;
-        if (ts - this._lastMinimapTs >= 75) {
-          this._lastMinimapTs = ts;
-          this._drawMinimap();
+        if (ts - this.#lastMinimapTs >= 75) {
+          this.#lastMinimapTs = ts;
+          this.drawMinimap();
         }
-        this._minimapRaf = requestAnimationFrame(tick);
+        this.#minimapRaf = requestAnimationFrame(tick);
       };
-      this._drawMinimap();
-      this._minimapRaf = requestAnimationFrame(tick);
+      this.drawMinimap();
+      this.#minimapRaf = requestAnimationFrame(tick);
     }
 
-    _stopMinimapLoop() {
-      if (this._minimapRaf && typeof cancelAnimationFrame === "function") {
-        cancelAnimationFrame(this._minimapRaf);
+    stopMinimapLoop() {
+      if (this.#minimapRaf) {
+        cancelAnimationFrame(this.#minimapRaf);
+        this.#minimapRaf = 0;
       }
-      this._minimapRaf = null;
     }
 
-    _drawMinimap() {
+    drawMinimap() {
       if (!this.minimapCanvas) return;
-      this._updateMinimapSize();
-      const srcVideo = isFullRegion(this.region)
-        ? this.video
-        : this._ensureSourceMonitor();
+      this.updateMinimapSize();
+      const srcVideo = isFullRegion(this.#controller.region)
+        ? this.#controller.video
+        : this.#controller.ensureSourceMonitor();
       try {
-        const ctx = this.minimapCanvas.getContext && this.minimapCanvas.getContext("2d");
-        if (ctx) ctx.drawImage(srcVideo, 0, 0, this.minimapCanvas.width, this.minimapCanvas.height);
-      } catch (_e) {}
+        const ctx = this.minimapCanvas.getContext("2d");
+        ctx?.drawImage(srcVideo, 0, 0, this.minimapCanvas.width, this.minimapCanvas.height);
+      } catch {
+        // Source video has not decoded its first frame yet.
+      }
     }
 
     // Opens a large view of the uncropped monitor so you can drag a box around a
@@ -2099,8 +1654,9 @@
       this.isDrawing = true;
       this.closeHud();
 
-      const monitor = isFullRegion(this.region) ? this.video : this._ensureSourceMonitor();
-      const dims = this._getOriginalDimensions();
+      const ctrl = this.#controller;
+      const monitor = isFullRegion(ctrl.region) ? ctrl.video : ctrl.ensureSourceMonitor();
+      const dims = ctrl.getOriginalDimensions();
       const aspect = clamp(dims.width / Math.max(1, dims.height), 0.5, 5);
 
       const maxW = Math.min(window.innerWidth * 0.9, 1400);
@@ -2114,9 +1670,15 @@
       stageW = Math.max(240, Math.round(stageW));
       stageH = Math.max(140, Math.round(stageH));
 
+      this.#modalAbort = new AbortController();
+      const { signal } = this.#modalAbort;
+
       const modal = document.createElement("div");
       modal.className = "dsc-draw-modal";
-      this._shieldEvents(modal);
+      modal.setAttribute("role", "dialog");
+      modal.setAttribute("aria-modal", "true");
+      modal.setAttribute("aria-label", "Draw custom stream crop region");
+      shieldPlayerEvents(modal, signal);
 
       const bar = document.createElement("div");
       bar.className = "dsc-draw-modal-bar";
@@ -2126,7 +1688,7 @@
       cancelBtn.type = "button";
       cancelBtn.className = "dsc-icon-btn";
       cancelBtn.textContent = "Cancel (Esc)";
-      cancelBtn.addEventListener("click", () => this.closeDrawModal());
+      cancelBtn.addEventListener("click", () => this.closeDrawModal(), { signal });
       bar.appendChild(cancelBtn);
 
       const stage = document.createElement("div");
@@ -2148,20 +1710,16 @@
       readout.className = "dsc-draw-readout";
       selBox.appendChild(readout);
 
-      stage.appendChild(canvas);
-      stage.appendChild(selBox);
-      modal.appendChild(bar);
-      modal.appendChild(stage);
+      stage.append(canvas, selBox);
+      modal.append(bar, stage);
 
+      const ctx = canvas.getContext("2d");
       const drawPreview = () => {
         if (!this.isDrawing) return;
         try {
-          const ctx = canvas.getContext && canvas.getContext("2d");
-          if (ctx) ctx.drawImage(monitor, 0, 0, canvas.width, canvas.height);
-        } catch (_e) {}
-        if (typeof requestAnimationFrame === "function") {
-          this.drawModalRaf = requestAnimationFrame(drawPreview);
-        }
+          ctx?.drawImage(monitor, 0, 0, canvas.width, canvas.height);
+        } catch {}
+        this.#drawModalRaf = requestAnimationFrame(drawPreview);
       };
 
       let startX = 0;
@@ -2200,9 +1758,6 @@
         e.preventDefault();
         e.stopPropagation();
 
-        window.removeEventListener("mousemove", onMove, true);
-        window.removeEventListener("mouseup", onUp, true);
-
         const bounds = stage.getBoundingClientRect();
         const ex = clamp(e.clientX - bounds.left, 0, bounds.width);
         const ey = clamp(e.clientY - bounds.top, 0, bounds.height);
@@ -2213,13 +1768,10 @@
 
         this.closeDrawModal();
 
-        // Ignore accidental clicks without a real drag.
-        if (w < 14 || h < 14 || bounds.width <= 0 || bounds.height <= 0) {
-          return;
-        }
+        if (w < 14 || h < 14 || bounds.width <= 0 || bounds.height <= 0) return;
 
-        this.activePreset = "custom";
-        this.setRegion({
+        ctrl.activePreset = "custom";
+        ctrl.setRegion({
           x: x1 / bounds.width,
           y: y1 / bounds.height,
           w: w / bounds.width,
@@ -2227,52 +1779,55 @@
         });
       };
 
-      this._cleanupModalDrag = () => {
-        window.removeEventListener("mousemove", onMove, true);
-        window.removeEventListener("mouseup", onUp, true);
-      };
+      stage.addEventListener(
+        "mousedown",
+        (e) => {
+          if (e.button !== undefined && e.button !== 0) return;
+          e.preventDefault();
+          e.stopPropagation();
+          const bounds = stage.getBoundingClientRect();
+          startX = clamp(e.clientX - bounds.left, 0, bounds.width);
+          startY = clamp(e.clientY - bounds.top, 0, bounds.height);
+          dragging = true;
+          selBox.style.display = "block";
+          selBox.style.left = `${startX}px`;
+          selBox.style.top = `${startY}px`;
+          selBox.style.width = "1px";
+          selBox.style.height = "1px";
 
-      stage.addEventListener("mousedown", (e) => {
-        if (e.button !== undefined && e.button !== 0) return;
-        e.preventDefault();
-        e.stopPropagation();
-        const bounds = stage.getBoundingClientRect();
-        startX = clamp(e.clientX - bounds.left, 0, bounds.width);
-        startY = clamp(e.clientY - bounds.top, 0, bounds.height);
-        dragging = true;
-        selBox.style.display = "block";
-        selBox.style.left = `${startX}px`;
-        selBox.style.top = `${startY}px`;
-        selBox.style.width = "1px";
-        selBox.style.height = "1px";
+          window.addEventListener("mousemove", onMove, { capture: true, signal });
+          window.addEventListener("mouseup", onUp, { capture: true, signal });
+        },
+        { signal }
+      );
 
-        window.addEventListener("mousemove", onMove, true);
-        window.addEventListener("mouseup", onUp, true);
-      });
-
-      modal.addEventListener("click", (e) => {
-        if (e.target === modal) this.closeDrawModal();
-      });
+      modal.addEventListener(
+        "click",
+        (e) => {
+          if (e.target === modal) this.closeDrawModal();
+        },
+        { signal }
+      );
 
       document.body.appendChild(modal);
       this.drawModalEl = modal;
+      cancelBtn.focus?.();
       drawPreview();
     }
 
     closeDrawModal() {
       if (!this.isDrawing && !this.drawModalEl) return;
       this.isDrawing = false;
-      if (this.drawModalRaf && typeof cancelAnimationFrame === "function") {
-        cancelAnimationFrame(this.drawModalRaf);
-        this.drawModalRaf = null;
+      if (this.#drawModalRaf) {
+        cancelAnimationFrame(this.#drawModalRaf);
+        this.#drawModalRaf = 0;
       }
-      if (this._cleanupModalDrag) {
-        this._cleanupModalDrag();
-        this._cleanupModalDrag = null;
-      }
-      if (this.drawModalEl) {
-        this.drawModalEl.remove();
-        this.drawModalEl = null;
+      this.#modalAbort?.abort();
+      this.#modalAbort = null;
+      this.drawModalEl?.remove();
+      this.drawModalEl = null;
+      if (isFullRegion(this.#controller.region) && !this.isOpen) {
+        this.#controller.destroySourceMonitor();
       }
     }
 
@@ -2283,25 +1838,602 @@
 
     openHud() {
       this.isOpen = true;
-      if (this.rootEl) this.rootEl.classList.add("dsc-open");
-      this._updateMinimapSize();
+      this.rootEl?.classList.add("dsc-open");
+      this.triggerBtn?.setAttribute("aria-expanded", "true");
+      this.updateMinimapSize();
       this.renderSavedPresets();
-      this.syncUI();
-      this._startMinimapLoop();
+      this.sync();
+      this.startMinimapLoop();
     }
 
     closeHud() {
       this.isOpen = false;
-      this._stopMinimapLoop();
-      if (this.rootEl) this.rootEl.classList.remove("dsc-open");
+      this.stopMinimapLoop();
+      this.rootEl?.classList.remove("dsc-open");
+      this.triggerBtn?.setAttribute("aria-expanded", "false");
+      if (isFullRegion(this.#controller.region) && !this.isDrawing) {
+        this.#controller.destroySourceMonitor();
+      }
+    }
+
+    containsTarget(target) {
+      return !!(
+        (this.rootEl && target && this.rootEl.contains(target)) ||
+        (this.drawModalEl && target && this.drawModalEl.contains(target))
+      );
+    }
+
+    sync() {
+      if (!this.rootEl) return;
+      const ctrl = this.#controller;
+      const settings = ctrl.manager.settings;
+
+      this.rootEl.classList.toggle("dsc-pos-top-left", settings.buttonPosition === "top-left");
+
+      const cropped = !isFullRegion(ctrl.region);
+      this.triggerBtn?.classList.toggle("dsc-is-cropped", cropped);
+
+      const dims = ctrl.getOriginalDimensions();
+      const outRect = computePixelCropRect(ctrl.region, dims.width, dims.height);
+
+      if (this.triggerResSpan) {
+        this.triggerResSpan.textContent =
+          cropped && settings.showResolutionBadge ? `${outRect.width}×${outRect.height}` : "";
+      }
+
+      if (this.metaSpan) {
+        this.metaSpan.textContent = cropped
+          ? `${outRect.width}×${outRect.height} (from ${dims.width}×${dims.height})`
+          : `${dims.width}×${dims.height}`;
+      }
+
+      for (const [id, btn] of this.#presetBtns) {
+        const selected = ctrl.activePreset === id;
+        btn.classList.toggle("dsc-selected", selected);
+        btn.setAttribute("aria-pressed", String(selected));
+      }
+
+      if (this.minimapBox) {
+        this.minimapBox.style.left = `${(ctrl.region.x * 100).toFixed(2)}%`;
+        this.minimapBox.style.top = `${(ctrl.region.y * 100).toFixed(2)}%`;
+        this.minimapBox.style.width = `${(ctrl.region.w * 100).toFixed(2)}%`;
+        this.minimapBox.style.height = `${(ctrl.region.h * 100).toFixed(2)}%`;
+      }
+    }
+
+    renderSavedPresets() {
+      if (!this.savedRowEl) return;
+      const list = this.#controller.manager.savedPresets;
+      this.savedRowEl.innerHTML = "";
+
+      if (!list.length) {
+        this.savedRowEl.style.display = "none";
+        return;
+      }
+      this.savedRowEl.style.display = "flex";
+
+      for (const [idx, item] of list.entries()) {
+        const pill = document.createElement("div");
+        pill.className = "dsc-saved-pill";
+
+        const applyBtn = document.createElement("button");
+        applyBtn.type = "button";
+        applyBtn.className = "dsc-saved-apply";
+        applyBtn.textContent = item.name;
+        applyBtn.title = `Apply "${item.name}"`;
+        applyBtn.addEventListener("click", () => {
+          this.#controller.activePreset = "custom";
+          this.#controller.setRegion(item.region);
+        });
+
+        const delBtn = document.createElement("button");
+        delBtn.type = "button";
+        delBtn.className = "dsc-saved-del";
+        delBtn.textContent = "×";
+        delBtn.title = `Delete "${item.name}"`;
+        delBtn.setAttribute("aria-label", `Delete preset ${item.name}`);
+        delBtn.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          this.#controller.manager.deletePreset(idx);
+        });
+
+        pill.append(applyBtn, delBtn);
+        this.savedRowEl.appendChild(pill);
+      }
+    }
+
+    destroy() {
+      this.closeDrawModal();
+      this.stopMinimapLoop();
+      this.#listeners.abort();
+
+      for (const tip of this.#tooltips) {
+        try {
+          tip?.destroy?.();
+        } catch {}
+      }
+      this.#tooltips = [];
+
+      this.rootEl?.remove();
+      this.rootEl = null;
+    }
+  }
+
+  // Owns the `<video>` stream lifecycle: intercepting React `srcObject` re-renders,
+  // maintaining the `MediaStreamCropSession`, and recalling per-streamer crops.
+  class VideoSourceController {
+    #listeners = new AbortController();
+    #nativeSrcDesc = null;
+    #offRemoved = null;
+    #hoverTimer = null;
+    #didAutoCrop = false;
+
+    constructor(video, manager) {
+      this.video = video;
+      this.manager = manager;
+
+      this.originalStream = video.srcObject;
+      this.cropSession = null;
+
+      // Secondary muted <video> attached to the uncropped `originalStream` so our
+      // minimap and Draw Custom Region modal still show the full monitor even
+      // after `this.video.srcObject` has been swapped to the cropped stream.
+      this.sourceMonitorVideo = null;
+
+      this.region = { ...FULL_REGION };
+      this.activePreset = "full";
+      this.host = null;
+      this.promotedHostPos = false;
+      this.overlay = new StreamCropOverlay(this);
+    }
+
+    get isOpen() {
+      return this.overlay.isOpen;
+    }
+
+    get isDrawing() {
+      return this.overlay.isDrawing;
+    }
+
+    closeHud() {
+      this.overlay.closeHud();
+    }
+
+    closeDrawModal() {
+      this.overlay.closeDrawModal();
     }
 
     handleOutsidePointer(event) {
-      if (!this.isOpen) return;
-      const target = event.target;
-      if (this.rootEl && target && this.rootEl.contains(target)) return;
-      if (this.drawModalEl && target && this.drawModalEl.contains(target)) return;
-      this.closeHud();
+      if (this.overlay.isOpen && !this.overlay.containsTarget(event.target)) {
+        this.overlay.closeHud();
+      }
+    }
+
+    syncUI() {
+      this.overlay.sync();
+    }
+
+    renderSavedPresets() {
+      this.overlay.renderSavedPresets();
+    }
+
+    // Climb out of the inner `<video>` flex box so the `Crop` button sits in the
+    // top corner of the full stream stage, but stop before climbing into the outer
+    // call container that also wraps the participant avatar row at the bottom.
+    resolveHostContainer() {
+      const immediate = this.video.parentElement;
+      if (!immediate) return null;
+
+      let best = immediate;
+      let cur = immediate;
+
+      for (let depth = 0; depth < 8 && cur && cur !== document.body && cur !== document.documentElement; depth++) {
+        if (cur.querySelectorAll("video").length > 1) break;
+
+        if (cur !== immediate && cur.children.length > 1) {
+          let hasParticipantRow = false;
+          for (const child of cur.children) {
+            if (child.contains(this.video)) continue;
+            const cr = child.getBoundingClientRect();
+            const cw = child.clientWidth || cr.width;
+            const ch = child.clientHeight || cr.height;
+            if (cw > 300 && ch >= 95) {
+              hasParticipantRow = true;
+              break;
+            }
+          }
+          if (hasParticipantRow) break;
+        }
+
+        const rect = cur.getBoundingClientRect();
+        const w = cur.clientWidth || rect.width;
+        const h = cur.clientHeight || rect.height;
+        if (w >= MIN_STAGE_VIDEO_WIDTH && h >= MIN_STAGE_VIDEO_HEIGHT) {
+          best = cur;
+        }
+
+        cur = cur.parentElement;
+      }
+
+      return best;
+    }
+
+    mount() {
+      const host = this.resolveHostContainer();
+      if (!host) return;
+      this.host = host;
+
+      const pos = window.getComputedStyle(host).position;
+      if (!pos || pos === "static") {
+        host.classList.add("dsc-host-positioned");
+        this.promotedHostPos = true;
+      }
+
+      this.installVideoSrcHook();
+      host.appendChild(this.overlay.build());
+      this.watchOverlayRemoval();
+
+      const { signal } = this.#listeners;
+      host.addEventListener("mouseenter", () => this.setHover(true), { signal });
+      host.addEventListener("mousemove", () => this.bumpHover(), { passive: true, signal });
+      host.addEventListener("mouseleave", () => this.setHover(false), { signal });
+      this.video.addEventListener("loadedmetadata", () => this.handleStreamMetadata(), { signal });
+      this.video.addEventListener("resize", () => this.handleStreamMetadata(), { signal });
+
+      this.handleStreamMetadata();
+      this.syncUI();
+    }
+
+    setNativeSrcObject(stream) {
+      if (this.#nativeSrcDesc?.set) {
+        this.#nativeSrcDesc.set.call(this.video, stream);
+      } else {
+        this.video.srcObject = stream;
+      }
+    }
+
+    getNativeSrcObject() {
+      return this.#nativeSrcDesc?.get
+        ? this.#nativeSrcDesc.get.call(this.video)
+        : this.video.srcObject;
+    }
+
+    // Discord's React tree periodically re-renders the player and re-runs
+    // `video.srcObject = originalStream`. We shadow `srcObject` on this single
+    // `<video>` instance (never on HTMLMediaElement.prototype) so React re-renders
+    // don't clobber an active crop, while genuine stream switches are caught cleanly.
+    installVideoSrcHook() {
+      this.removeVideoSrcHook();
+
+      let desc = null;
+      let proto = Object.getPrototypeOf(this.video);
+      while (proto && !desc) {
+        desc = Object.getOwnPropertyDescriptor(proto, "srcObject");
+        proto = Object.getPrototypeOf(proto);
+      }
+      if (!desc?.get || !desc?.set) return;
+
+      this.#nativeSrcDesc = desc;
+      const controller = this;
+
+      Object.defineProperty(this.video, "srcObject", {
+        configurable: true,
+        enumerable: desc.enumerable,
+        get() {
+          return desc.get.call(this);
+        },
+        set(incomingStream) {
+          if (incomingStream && CROPPED_STREAMS.has(incomingStream)) {
+            desc.set.call(this, incomingStream);
+            return;
+          }
+
+          if (!incomingStream) {
+            controller.teardownCropSession(false);
+            controller.originalStream = null;
+            desc.set.call(this, null);
+            return;
+          }
+
+          if (controller.originalStream && incomingStream === controller.originalStream) {
+            desc.set.call(this, controller.cropSession?.outputStream ?? incomingStream);
+            return;
+          }
+
+          controller.adoptIncomingStream(incomingStream, (s) => desc.set.call(this, s));
+        }
+      });
+    }
+
+    adoptIncomingStream(incomingStream, applyRawStream) {
+      this.originalStream = incomingStream;
+      this.#didAutoCrop = false;
+      if (this.sourceMonitorVideo) {
+        this.sourceMonitorVideo.srcObject = incomingStream;
+      }
+
+      const recalled = this.manager.recallStreamCrop(this.getStreamIdentities());
+      if (recalled && !isFullRegion(recalled.region)) {
+        this.region = normalizeRegion(recalled.region);
+        this.activePreset = recalled.preset || "custom";
+        this.#didAutoCrop = true;
+        this.rebuildCropSession();
+        this.syncUI();
+        return;
+      }
+
+      // Don't carry someone's ultrawide crop over onto a different streamer's 16:9 feed.
+      this.teardownCropSession(false);
+      this.region = { ...FULL_REGION };
+      this.activePreset = "full";
+      applyRawStream?.(incomingStream);
+      this.handleStreamMetadata();
+      this.syncUI();
+    }
+
+    removeVideoSrcHook() {
+      if (!this.#nativeSrcDesc) return;
+      try {
+        delete this.video.srcObject;
+      } catch {}
+      this.#nativeSrcDesc = null;
+    }
+
+    ensureMounted() {
+      if (!this.host?.isConnected) return;
+      if (this.overlay.rootEl && !this.overlay.rootEl.isConnected) {
+        this.host.appendChild(this.overlay.rootEl);
+      }
+
+      const current = this.getNativeSrcObject();
+      if (current && !CROPPED_STREAMS.has(current) && current !== this.originalStream) {
+        this.adoptIncomingStream(current, null);
+      }
+    }
+
+    watchOverlayRemoval() {
+      this.#offRemoved?.();
+      this.#offRemoved = null;
+      const rootEl = this.overlay.rootEl;
+      if (!rootEl || !this.manager.api.DOM.onRemoved) return;
+
+      this.#offRemoved = this.manager.api.DOM.onRemoved(rootEl, () => {
+        if (this.host?.isConnected && this.video.isConnected && this.overlay.rootEl) {
+          this.host.appendChild(this.overlay.rootEl);
+          this.watchOverlayRemoval();
+        }
+      });
+    }
+
+    destroy() {
+      this.#offRemoved?.();
+      this.#offRemoved = null;
+
+      clearTimeout(this.#hoverTimer);
+      this.#hoverTimer = null;
+
+      this.#listeners.abort();
+      this.removeVideoSrcHook();
+      this.teardownCropSession(true);
+      this.destroySourceMonitor();
+      this.overlay.destroy();
+
+      if (this.host) {
+        this.host.classList.remove("dsc-host-hover");
+        if (this.promotedHostPos) {
+          this.host.classList.remove("dsc-host-positioned");
+          this.promotedHostPos = false;
+        }
+        this.host = null;
+      }
+    }
+
+    // Grab the streamer's display name from Discord's overlay badge without relying
+    // on hashed Discord class names that break on client updates.
+    extractStreamerLabel() {
+      if (!this.host) return "";
+      for (const el of this.host.querySelectorAll("span, div")) {
+        if (this.overlay.rootEl?.contains(el)) continue;
+        if (el.children.length > 0) continue;
+        const text = el.textContent?.trim() ?? "";
+        if (
+          text.length >= 2 &&
+          text.length <= 32 &&
+          !/^(LIVE|HD|FHD|QHD|4K|1080p|720p|1440p|60|30|FPS|\d+[:x×]\d+)$/i.test(text)
+        ) {
+          return text.toLowerCase();
+        }
+      }
+      return "";
+    }
+
+    getStreamIdentities() {
+      const sessionKeys = [];
+      const persistentKeys = [];
+
+      if (this.originalStream) {
+        if (this.originalStream.id) sessionKeys.push(`stream:${this.originalStream.id}`);
+        const [vTrack] = this.originalStream.getVideoTracks?.() ?? [];
+        if (vTrack?.id) sessionKeys.push(`track:${vTrack.id}`);
+      }
+
+      const dims = this.getOriginalDimensions();
+      const hasDims = dims.width > 0 && dims.height > 0;
+      const streamer = this.extractStreamerLabel();
+
+      if (streamer && hasDims) persistentKeys.push(`streamer:${streamer}|${dims.width}x${dims.height}`);
+      if (streamer) persistentKeys.push(`streamer:${streamer}`);
+      if (hasDims && dims.width / Math.max(1, dims.height) > 2.05) {
+        persistentKeys.push(`ultrawide-res:${dims.width}x${dims.height}`);
+      }
+
+      return { sessionKeys, persistentKeys };
+    }
+
+    handleStreamMetadata() {
+      const dims = this.getOriginalDimensions();
+      const aspect = dims.width / Math.max(1, dims.height);
+
+      if (!this.#didAutoCrop && isFullRegion(this.region)) {
+        const recalled = this.manager.recallStreamCrop(this.getStreamIdentities());
+        if (recalled && !isFullRegion(recalled.region)) {
+          this.#didAutoCrop = true;
+          this.region = normalizeRegion(recalled.region);
+          this.activePreset = recalled.preset || "custom";
+          this.applySourceCrop();
+          this.syncUI();
+          return;
+        }
+      }
+
+      if (
+        !this.#didAutoCrop &&
+        this.manager.settings.autoCenterUltrawide &&
+        isFullRegion(this.region) &&
+        dims.width > 0 &&
+        aspect > 2.15
+      ) {
+        this.#didAutoCrop = true;
+        this.applyPreset("center");
+        return;
+      }
+
+      this.syncUI();
+    }
+
+    setHover(hovered) {
+      if (!this.host) return;
+      if (hovered) {
+        this.bumpHover();
+      } else {
+        clearTimeout(this.#hoverTimer);
+        this.#hoverTimer = null;
+        this.host.classList.remove("dsc-host-hover");
+      }
+    }
+
+    bumpHover() {
+      if (!this.host) return;
+      this.host.classList.add("dsc-host-hover");
+      clearTimeout(this.#hoverTimer);
+      this.#hoverTimer = setTimeout(() => {
+        if (this.host && !this.isOpen) {
+          this.host.classList.remove("dsc-host-hover");
+        }
+      }, 2200);
+    }
+
+    getOriginalDimensions() {
+      if (this.sourceMonitorVideo?.videoWidth > 0 && this.sourceMonitorVideo?.videoHeight > 0) {
+        return {
+          width: this.sourceMonitorVideo.videoWidth,
+          height: this.sourceMonitorVideo.videoHeight
+        };
+      }
+
+      const [vTrack] = this.originalStream?.getVideoTracks?.() ?? [];
+      const settings = vTrack?.getSettings?.();
+      if (settings?.width > 0 && settings?.height > 0) {
+        return { width: settings.width, height: settings.height };
+      }
+
+      if (isFullRegion(this.region) && this.video.videoWidth > 0 && this.video.videoHeight > 0) {
+        return { width: this.video.videoWidth, height: this.video.videoHeight };
+      }
+
+      return {
+        width: this.video.videoWidth || this.video.clientWidth || 1920,
+        height: this.video.videoHeight || this.video.clientHeight || 1080
+      };
+    }
+
+    ensureSourceMonitor() {
+      if (this.sourceMonitorVideo) {
+        if (this.originalStream && this.sourceMonitorVideo.srcObject !== this.originalStream) {
+          this.sourceMonitorVideo.srcObject = this.originalStream;
+        }
+        return this.sourceMonitorVideo;
+      }
+
+      const monitor = document.createElement("video");
+      monitor.dataset.dscInternal = "true";
+      monitor.muted = true;
+      monitor.autoplay = true;
+      monitor.playsInline = true;
+      if (this.originalStream) monitor.srcObject = this.originalStream;
+      monitor.play()?.catch(() => {});
+      this.sourceMonitorVideo = monitor;
+      return monitor;
+    }
+
+    destroySourceMonitor() {
+      if (!this.sourceMonitorVideo) return;
+      this.sourceMonitorVideo.pause();
+      this.sourceMonitorVideo.srcObject = null;
+      this.sourceMonitorVideo = null;
+    }
+
+    applySourceCrop() {
+      if (isFullRegion(this.region)) {
+        this.teardownCropSession(true);
+        return;
+      }
+
+      if (!this.originalStream) {
+        const cur = this.getNativeSrcObject();
+        if (cur && !CROPPED_STREAMS.has(cur)) this.originalStream = cur;
+      }
+      if (!this.originalStream) return;
+
+      if (this.isOpen || this.isDrawing) {
+        this.ensureSourceMonitor();
+      }
+
+      // Mutate crop bounds live on the active session without reconstructing the MediaStream.
+      if (this.cropSession && !this.cropSession.disposed && this.cropSession.sourceStream === this.originalStream) {
+        this.cropSession.setRegion(this.region);
+        return;
+      }
+
+      this.rebuildCropSession();
+    }
+
+    rebuildCropSession() {
+      if (this.cropSession) {
+        this.cropSession.stop();
+        this.cropSession = null;
+      }
+      if (!this.originalStream || isFullRegion(this.region)) return;
+
+      const session = new MediaStreamCropSession(this.originalStream, this.region, {
+        onStreamReplaced: (fallbackStream) => {
+          if (this.cropSession !== session || !this.video.isConnected) return;
+          this.setNativeSrcObject(fallbackStream);
+          this.video.play()?.catch(() => {});
+        }
+      });
+      const croppedStream = session.start();
+      if (!croppedStream) return;
+
+      this.cropSession = session;
+      this.setNativeSrcObject(croppedStream);
+      this.video.play()?.catch(() => {});
+    }
+
+    teardownCropSession(restoreOriginal) {
+      const hadSession = !!this.cropSession;
+      if (this.cropSession) {
+        this.cropSession.stop();
+        this.cropSession = null;
+      }
+      if (!this.isOpen && !this.isDrawing) {
+        this.destroySourceMonitor();
+      }
+      if (restoreOriginal && hadSession && this.originalStream && this.video.isConnected) {
+        this.setNativeSrcObject(this.originalStream);
+        this.video.play()?.catch(() => {});
+      }
     }
 
     setRegion(nextRegion, persist = true) {
@@ -2309,9 +2441,9 @@
       if (isFullRegion(this.region)) {
         this.activePreset = "full";
       }
-      this._applySourceCrop();
+      this.applySourceCrop();
       if (persist) {
-        this.manager.rememberStreamCrop(this._getStreamIdentities(), this.region, this.activePreset);
+        this.manager.rememberStreamCrop(this.getStreamIdentities(), this.region, this.activePreset);
       }
       this.syncUI();
     }
@@ -2321,7 +2453,7 @@
         this.reset(persist);
         return;
       }
-      const dims = this._getOriginalDimensions();
+      const dims = this.getOriginalDimensions();
       const aspect = dims.width / Math.max(1, dims.height);
       this.activePreset = presetId;
       this.region = computeSourcePreset(
@@ -2329,9 +2461,9 @@
         aspect,
         this.manager.settings.defaultSliceAspect
       );
-      this._applySourceCrop();
+      this.applySourceCrop();
       if (persist) {
-        this.manager.rememberStreamCrop(this._getStreamIdentities(), this.region, this.activePreset);
+        this.manager.rememberStreamCrop(this.getStreamIdentities(), this.region, this.activePreset);
       }
       this.syncUI();
     }
@@ -2340,92 +2472,12 @@
       this.closeDrawModal();
       this.region = { ...FULL_REGION };
       this.activePreset = "full";
-      this._didAutoCrop = true;
-      this._teardownCropSession(true);
+      this.#didAutoCrop = true;
+      this.teardownCropSession(true);
       if (persist) {
-        this.manager.rememberStreamCrop(this._getStreamIdentities(), this.region, "full");
+        this.manager.rememberStreamCrop(this.getStreamIdentities(), this.region, "full");
       }
       this.syncUI();
-    }
-
-    syncUI() {
-      if (!this.rootEl) return;
-
-      const posLeft = this.manager.settings.buttonPosition === "top-left";
-      this.rootEl.classList.toggle("dsc-pos-top-left", posLeft);
-
-      const cropped = !isFullRegion(this.region);
-      if (this.triggerBtn) {
-        this.triggerBtn.classList.toggle("dsc-is-cropped", cropped);
-      }
-
-      const dims = this._getOriginalDimensions();
-      const outRect = computePixelCropRect(this.region, dims.width, dims.height);
-
-      if (this.triggerResSpan) {
-        this.triggerResSpan.textContent =
-          cropped && this.manager.settings.showResolutionBadge
-            ? `${outRect.width}×${outRect.height}`
-            : "";
-      }
-
-      if (this.metaSpan) {
-        this.metaSpan.textContent = cropped
-          ? `${outRect.width}×${outRect.height} (from ${dims.width}×${dims.height})`
-          : `${dims.width}×${dims.height}`;
-      }
-
-      for (const [id, btn] of this._presetBtns.entries()) {
-        btn.classList.toggle("dsc-selected", this.activePreset === id);
-      }
-
-      if (this.minimapBox) {
-        this.minimapBox.style.left = `${(this.region.x * 100).toFixed(2)}%`;
-        this.minimapBox.style.top = `${(this.region.y * 100).toFixed(2)}%`;
-        this.minimapBox.style.width = `${(this.region.w * 100).toFixed(2)}%`;
-        this.minimapBox.style.height = `${(this.region.h * 100).toFixed(2)}%`;
-      }
-    }
-
-    renderSavedPresets() {
-      if (!this.savedRowEl) return;
-      const list = this.manager.savedPresets;
-      this.savedRowEl.innerHTML = "";
-
-      if (!list.length) {
-        this.savedRowEl.style.display = "none";
-        return;
-      }
-      this.savedRowEl.style.display = "flex";
-
-      list.forEach((item, idx) => {
-        const pill = document.createElement("button");
-        pill.type = "button";
-        pill.className = "dsc-saved-pill";
-        pill.title = `Apply "${item.name}"`;
-
-        const nameSpan = document.createElement("span");
-        nameSpan.textContent = item.name;
-
-        const delSpan = document.createElement("span");
-        delSpan.className = "dsc-saved-del";
-        delSpan.textContent = "×";
-        delSpan.title = `Delete "${item.name}"`;
-        delSpan.addEventListener("click", (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          this.manager.deletePreset(idx);
-        });
-
-        pill.appendChild(nameSpan);
-        pill.appendChild(delSpan);
-        pill.addEventListener("click", () => {
-          this.activePreset = "custom";
-          this.setRegion(item.region);
-        });
-
-        this.savedRowEl.appendChild(pill);
-      });
     }
   }
 
