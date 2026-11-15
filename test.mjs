@@ -612,7 +612,7 @@ test("2. Even-aligned pixel crop math & 32:9 -> 2560x1440 (16:9) native monitor 
   const right = computeSourcePreset("right", 5120 / 1440, "16:9");
   assert.deepEqual({ ...computePixelCropRect(right, 5120, 1440) }, { x: 2560, y: 0, width: 2560, height: 1440 });
 
-  // Odd fractional region always rounds to safe even-aligned NV12/I420 coordinates inside frame bounds
+  // Odd fractional region and odd hardware decoder origin offsets always round to safe even-aligned NV12/I420 coordinates inside frame bounds
   const oddRect = computePixelCropRect({ x: 0.1333, y: 0.2111, w: 0.4111, h: 0.5333 }, 1920, 1080);
   assert.equal(oddRect.x % 2, 0);
   assert.equal(oddRect.y % 2, 0);
@@ -620,6 +620,16 @@ test("2. Even-aligned pixel crop math & 32:9 -> 2560x1440 (16:9) native monitor 
   assert.equal(oddRect.height % 2, 0);
   assert.ok(oddRect.x + oddRect.width <= 1920);
   assert.ok(oddRect.y + oddRect.height <= 1080);
+
+  const oddOriginRect = computePixelCropRect({ x: 0, y: 0, w: 1, h: 1 }, 1919, 1079, 3, 5);
+  assert.equal(oddOriginRect.x % 2, 0);
+  assert.equal(oddOriginRect.y % 2, 0);
+  assert.equal(oddOriginRect.width % 2, 0);
+  assert.equal(oddOriginRect.height % 2, 0);
+  assert.ok(oddOriginRect.x >= 3);
+  assert.ok(oddOriginRect.y >= 5);
+  assert.ok(oddOriginRect.x + oddOriginRect.width <= 3 + 1919);
+  assert.ok(oddOriginRect.y + oddOriginRect.height <= 5 + 1079);
 });
 
 test("3. True WebCodecs MediaStream replacement, React srcObject re-render protection, Audio preservation & Reset", async () => {
@@ -1323,7 +1333,3 @@ test("9. Discord In-App Floating Mini-Player (PiP) & OS Picture-in-Picture crop 
 
   plugin.stop();
 });
-
-
-
-

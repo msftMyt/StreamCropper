@@ -710,6 +710,7 @@
 
     return true;
   }
+
   // Chromium's VideoFrame visibleRect requires even X/Y/width/height when the
   // underlying WebRTC decoder outputs 4:2:0 (I420 / NV12) planes; odd offsets
   // throw a DOMException on sub-sampled chroma planes. `originX`/`originY`
@@ -720,9 +721,11 @@
     const fh = Math.max(4, Math.floor(Number(frameHeight) || 1080));
     const ox = Math.max(0, Math.floor(Number(originX) || 0));
     const oy = Math.max(0, Math.floor(Number(originY) || 0));
+    const evenOx = ox + (ox % 2);
+    const evenOy = oy + (oy % 2);
 
-    const maxEvenW = fw - (fw % 2);
-    const maxEvenH = fh - (fh % 2);
+    const maxEvenW = Math.max(2, (ox + fw - evenOx) - ((ox + fw - evenOx) % 2));
+    const maxEvenH = Math.max(2, (oy + fh - evenOy) - ((oy + fh - evenOy) % 2));
 
     const width = clamp(roundDownEven(norm.w * fw, 16), 2, maxEvenW);
     const height = clamp(roundDownEven(norm.h * fh, 16), 2, maxEvenH);
@@ -732,10 +735,10 @@
     if (x % 2 !== 0) x -= 1;
     if (y % 2 !== 0) y -= 1;
 
-    x = clamp(x, ox, ox + fw - width);
-    y = clamp(y, oy, oy + fh - height);
-    if (x % 2 !== 0) x = Math.max(ox, x - 1);
-    if (y % 2 !== 0) y = Math.max(oy, y - 1);
+    x = clamp(x, evenOx, ox + fw - width);
+    y = clamp(y, evenOy, oy + fh - height);
+    if (x % 2 !== 0) x = Math.max(evenOx, x - 1);
+    if (y % 2 !== 0) y = Math.max(evenOy, y - 1);
 
     return { x, y, width, height };
   }
@@ -1521,9 +1524,14 @@
 
       if (width > MIN_STAGE_VIDEO_WIDTH && height > MIN_STAGE_VIDEO_HEIGHT) return true;
 
-      if (width >= MIN_MINIPLAYER_WIDTH && height >= MIN_MINIPLAYER_HEIGHT) {
+      if (width >= MIN_MINIPLAYER_WIDTH && height >= MIN_MINIPLAYER_HEIGHT && isStandaloneMiniPlayerVideo(video, doc)) {
         const recalled = this.recallStreamCrop(controller.getStreamIdentities());
         if (recalled && !isFullRegion(recalled.region)) return true;
+
+        if (this.settings.autoCenterUltrawide) {
+          const dims = controller.getOriginalDimensions();
+          return dims.width === 0 || dims.width / Math.max(1, dims.height) > 2.15;
+        }
       }
 
       return false;
@@ -2099,7 +2107,9 @@
 
       const bar = doc.createElement("div");
       bar.className = "dsc-draw-modal-bar";
-      bar.innerHTML = `<span>Drag across the part of the ${dims.width}×${dims.height} stream you want to watch</span>`;
+      const barText = doc.createElement("span");
+      barText.textContent = `Drag across the part of the ${dims.width}×${dims.height} stream you want to watch`;
+      bar.appendChild(barText);
 
       if (!isFullRegion(ctrl.region)) {
         const modalResetBtn = doc.createElement("button");
@@ -2383,7 +2393,7 @@
         applyBtn.addEventListener("click", () => {
           this.#controller.activePreset = "custom";
           this.#controller.setRegion(item.region);
-        });
+        }, { signal: this.#listeners.signal });
 
         const delBtn = this.doc.createElement("button");
         delBtn.type = "button";
@@ -2395,7 +2405,7 @@
           e.preventDefault();
           e.stopPropagation();
           this.#controller.manager.deletePreset(idx);
-        });
+        }, { signal: this.#listeners.signal });
 
         pill.append(applyBtn, delBtn);
         this.savedRowEl.appendChild(pill);
