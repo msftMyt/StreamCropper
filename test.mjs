@@ -70,7 +70,15 @@ function createMockDOM({ withWebCodecs = true } = {}) {
       let cur = this;
       while (cur) {
         pathNodes.push(cur);
-        cur = cur.parentElement || (cur._ownerDoc && cur !== cur._ownerDoc ? cur._ownerDoc : null);
+        if (cur.parentElement) {
+          cur = cur.parentElement;
+        } else if (cur._ownerDoc && cur !== cur._ownerDoc) {
+          cur = cur._ownerDoc;
+        } else if (cur.defaultView && cur !== cur.defaultView) {
+          cur = cur.defaultView;
+        } else {
+          cur = null;
+        }
       }
 
       for (let i = pathNodes.length - 1; i > 0; i--) {
@@ -282,6 +290,8 @@ function createMockDOM({ withWebCodecs = true } = {}) {
     constructor() {
       super();
       this._observers = new Set();
+      this.fullscreenElement = null;
+      this.webkitFullscreenElement = null;
       this.documentElement = new MockElement("html", this);
       this.head = new MockElement("head", this);
       this.body = new MockElement("body", this);
@@ -1023,5 +1033,132 @@ test("7. Discord Stream Popout Window support: cross-realm MediaStream, style in
   assert.equal(popoutEnv2.document._observers.size, 0, "stop() disconnected active popout observer");
   assert.equal(stage2.querySelector(".dsc-trigger"), null, "stop() destroyed active popout controller");
 });
+
+test("8. Fullscreen Mode support: Top-Layer modal mounting, dynamic fullscreenchange re-parenting, Escape capture & zero-interruption host re-homing", () => {
+  const { env, PluginClass } = loadPlugin({ asBetterDiscord: true, withWebCodecs: true });
+  const plugin = new PluginClass();
+  plugin.start();
+
+  const videoTrack = {
+    id: "fs-video-track",
+    kind: "video",
+    getSettings: () => ({ width: 5120, height: 1440 })
+  };
+  const audioTrack = { id: "fs-audio-track", kind: "audio" };
+  const rawStream = new env.MediaStream([videoTrack, audioTrack]);
+
+  // Normal inline stage container (static position -> promoted via .dsc-host-positioned)
+  const normalStage = env.document.createElement("div");
+  normalStage.clientWidth = 1600;
+  normalStage.clientHeight = 900;
+
+  // Dedicated fullscreen wrapper (e.g. Discord's fullscreen player root on a 3840x2160 monitor)
+  const fullscreenWrapper = env.document.createElement("div");
+  fullscreenWrapper.clientWidth = 3840;
+  fullscreenWrapper.clientHeight = 2160;
+
+  const video = env.document.createElement("video");
+  video.srcObject = rawStream;
+  video.clientWidth = 1600;
+  video.clientHeight = 450;
+  video.videoWidth = 5120;
+  video.videoHeight = 1440;
+
+  normalStage.appendChild(video);
+  env.document.body.appendChild(normalStage);
+  env.document.body.appendChild(fullscreenWrapper);
+
+  plugin.scan();
+
+  const controller = plugin.controllers.get(video);
+  assert.ok(controller, "Controller attached to stream video");
+  assert.equal(controller.host, normalStage, "Initially mounted on normalStage");
+  assert.equal(normalStage.classList.contains("dsc-host-positioned"), true, "normalStage promoted to positioned");
+
+  // 1) Start an active WebCodecs crop ("Center") before entering fullscreen
+  const trigger = normalStage.querySelector(".dsc-trigger");
+  trigger.dispatchEvent(env.makeEvent("click"));
+  const centerBtn = normalStage.querySelectorAll("button").find((b) => b.dataset.preset === "center");
+  centerBtn.dispatchEvent(env.makeEvent("click"));
+
+  const activeSession = controller.cropSession;
+  const activeCroppedStream = video.srcObject;
+  assert.ok(activeSession && !activeSession.disposed, "Active MediaStreamCropSession running");
+  assert.equal(PluginClass.isCroppedStream(activeCroppedStream), true);
+
+  // 2) Verify getModalMountTarget falls back to parentElement if `<video>` leaf itself is fullscreenElement
+  env.document.fullscreenElement = video;
+  assert.equal(
+    PluginClass.getModalMountTarget(env.document),
+    normalStage,
+    "Leaf <video> fullscreenElement falls back to parentElement instead of mounting <div> inside <video>"
+  );
+
+  // 3) Discord enters Fullscreen: moves `<video>` into `fullscreenWrapper` and sets `doc.fullscreenElement`
+  fullscreenWrapper.appendChild(video);
+  env.document.fullscreenElement = fullscreenWrapper;
+  env.document.dispatchEvent(env.makeEvent("fullscreenchange"));
+
+  assert.equal(controller.overlay.rootEl.parentElement, fullscreenWrapper, "Overlay rootEl re-homed onto fullscreenWrapper");
+  assert.equal(fullscreenWrapper.classList.contains("dsc-host-positioned"), true, "fullscreenWrapper received dsc-host-positioned");
+  assert.equal(normalStage.classList.contains("dsc-host-positioned"), false, "normalStage cleaned up dsc-host-positioned");
+  assert.equal(controller.cropSession, activeSession, "Active MediaStreamCropSession preserved without interruption");
+  assert.equal(activeSession.disposed, false, "Crop session was not disposed during fullscreen transition");
+  assert.equal(video.srcObject, activeCroppedStream, "Cropped MediaStream stayed attached seamlessly");
+
+  // 4) Open "Draw Custom Region" while in Fullscreen -> mounts inside `fullscreenWrapper` (Top Layer), NOT `doc.body`,
+  //    and scales stage dimensions to `fullscreenWrapper` (3840x2160) instead of `window` (1920x1080)
+  trigger.dispatchEvent(env.makeEvent("click"));
+  const drawBtn = fullscreenWrapper.querySelector(".dsc-draw-full-btn");
+  drawBtn.dispatchEvent(env.makeEvent("click"));
+
+  const modalInFs = fullscreenWrapper.querySelector(".dsc-draw-modal");
+  assert.ok(modalInFs, "Draw modal mounted inside fullscreenWrapper Top Layer");
+  assert.equal(env.document.body.children.includes(modalInFs), false, "Draw modal is NOT a direct child of document.body during fullscreen");
+
+  const drawStage = modalInFs.querySelector(".dsc-draw-stage");
+  assert.ok(
+    parseInt(drawStage.style.width, 10) > 1920,
+    `Fullscreen draw stage scaled to 4K fullscreenWrapper (${drawStage.style.width}) rather than 1080p window`
+  );
+
+  // 5) Pressing Escape while drawing cancels ONLY the draw modal and stops propagation before Discord's document/React listener can exit fullscreen
+  let discordFullscreenExitTriggered = false;
+  env.document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") discordFullscreenExitTriggered = true;
+  });
+  const escCancelEvent = env.makeEvent("keydown", { key: "Escape" });
+  modalInFs.dispatchEvent(escCancelEvent);
+
+  assert.equal(controller.isDrawing, false, "Escape cancelled active Draw Custom Region modal");
+  assert.equal(fullscreenWrapper.querySelector(".dsc-draw-modal"), null, "Draw modal removed on Escape");
+  assert.equal(escCancelEvent.defaultPrevented, true, "Escape keydown preventDefault() called");
+  assert.equal(discordFullscreenExitTriggered, false, "Window capture stopped Escape before reaching Discord's document listener");
+
+  // 6) Re-open Draw Custom Region in fullscreen, then exit browser fullscreen while modal is still open ->
+  //    `fullscreenchange` dynamically re-parents the open modal back to `doc.body` AND re-homes `overlay.rootEl` back to `normalStage`!
+  trigger.dispatchEvent(env.makeEvent("click"));
+  drawBtn.dispatchEvent(env.makeEvent("click"));
+  const openModal = fullscreenWrapper.querySelector(".dsc-draw-modal");
+  assert.ok(openModal, "Draw modal re-opened inside fullscreenWrapper");
+
+  normalStage.appendChild(video);
+  env.document.fullscreenElement = null;
+  env.document.dispatchEvent(env.makeEvent("fullscreenchange"));
+
+  assert.equal(openModal.parentElement, env.document.body, "Open draw modal dynamically re-parented back to document.body on fullscreen exit");
+  assert.ok(
+    parseInt(openModal.querySelector(".dsc-draw-stage").style.width, 10) <= 1400,
+    "Draw stage resized back down to normal window bounds on fullscreen exit"
+  );
+  assert.equal(controller.overlay.rootEl.parentElement, normalStage, "Overlay rootEl re-homed back onto normalStage");
+  assert.equal(normalStage.classList.contains("dsc-host-positioned"), true, "normalStage restored dsc-host-positioned");
+  assert.equal(fullscreenWrapper.classList.contains("dsc-host-positioned"), false, "fullscreenWrapper cleaned up dsc-host-positioned");
+  assert.equal(controller.cropSession, activeSession, "MediaStreamCropSession still uninterrupted after exiting fullscreen");
+  assert.equal(video.srcObject, activeCroppedStream, "Cropped MediaStream still active after exiting fullscreen");
+
+  plugin.stop();
+});
+
 
 

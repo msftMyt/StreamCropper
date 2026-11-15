@@ -558,6 +558,25 @@
     else clearTimeout(id);
   }
 
+  function getActiveFullscreenElement(doc) {
+    return doc?.fullscreenElement || doc?.webkitFullscreenElement || null;
+  }
+
+  // When Discord enters Fullscreen, elements appended to `document.body` render
+  // behind the browser's Fullscreen Top Layer. Mount inside the active fullscreen
+  // container instead — unless `<video>` itself is the fullscreen leaf element
+  // (which cannot render child `<div>` overlays), falling back to its parent/body.
+  function getModalMountTarget(doc) {
+    const fsEl = getActiveFullscreenElement(doc);
+    if (fsEl) {
+      if (fsEl.nodeName === "VIDEO") {
+        return fsEl.parentElement || doc.body || doc.documentElement;
+      }
+      return fsEl;
+    }
+    return doc?.body || doc?.documentElement || null;
+  }
+
   // Chromium's VideoFrame visibleRect requires even X/Y/width/height when the
   // underlying WebRTC decoder outputs 4:2:0 (I420 / NV12) planes; odd offsets
   // throw a DOMException on sub-sampled chroma planes. `originX`/`originY`
@@ -1056,23 +1075,28 @@
 
       doc.addEventListener("pointerdown", onOutsidePointer, { capture: true, signal });
       doc.addEventListener("mousedown", onOutsidePointer, { capture: true, signal });
-      win?.addEventListener?.(
-        "keydown",
-        (event) => {
-          if (event.key !== "Escape") return;
-          for (const controller of this.controllers.values()) {
-            if (controller.doc !== doc) continue;
-            if (controller.isDrawing) {
-              event.stopPropagation();
-              event.preventDefault();
-              controller.closeDrawModal();
-            } else if (controller.isOpen) {
-              controller.closeHud();
-            }
+
+      const onEscapeKeyDown = (event) => {
+        if (event.key !== "Escape") return;
+        for (const controller of this.controllers.values()) {
+          if (controller.doc !== doc) continue;
+          if (controller.isDrawing) {
+            event.stopPropagation();
+            event.preventDefault();
+            controller.closeDrawModal();
+          } else if (controller.isOpen) {
+            controller.closeHud();
           }
-        },
-        { capture: true, signal }
-      );
+        }
+      };
+
+      // Listen on `window` capture first (fires before `document` / React targets so
+      // Escape cancels drawing without accidentally exiting Discord fullscreen), plus
+      // `doc` capture if events are dispatched directly onto the document.
+      if (win?.addEventListener) {
+        win.addEventListener("keydown", onEscapeKeyDown, { capture: true, signal });
+      }
+      doc.addEventListener("keydown", onEscapeKeyDown, { capture: true, signal });
     }
 
     collectDocuments() {
@@ -1776,7 +1800,7 @@
             dragAbort.abort();
           };
 
-          const dragSignal = AbortSignal.any
+          const dragSignal = typeof AbortSignal !== "undefined" && AbortSignal.any
             ? AbortSignal.any([signal, dragAbort.signal])
             : dragAbort.signal;
           this.win.addEventListener("mousemove", onMove, { capture: true, signal: dragSignal });
@@ -1850,16 +1874,32 @@
       const dims = ctrl.getOriginalDimensions();
       const aspect = clamp(dims.width / Math.max(1, dims.height), 0.5, 5);
 
-      const maxW = Math.min((win.innerWidth || 1920) * 0.9, 1400);
-      const maxH = Math.min((win.innerHeight || 1080) * 0.78, 820);
-      let stageW = maxW;
-      let stageH = stageW / aspect;
-      if (stageH > maxH) {
-        stageH = maxH;
-        stageW = stageH * aspect;
+      const mountTarget = getModalMountTarget(doc);
+      if (!mountTarget) {
+        this.isDrawing = false;
+        return;
       }
-      stageW = Math.max(240, Math.round(stageW));
-      stageH = Math.max(140, Math.round(stageH));
+
+      const computeStageDimensions = (target) => {
+        const isFs = Boolean(getActiveFullscreenElement(doc));
+        const rect = isFs && target?.getBoundingClientRect ? target.getBoundingClientRect() : null;
+        const viewportW = (isFs ? (target?.clientWidth || rect?.width) : 0) || win.innerWidth || 1920;
+        const viewportH = (isFs ? (target?.clientHeight || rect?.height) : 0) || win.innerHeight || 1080;
+        const maxW = Math.min(viewportW * 0.9, isFs ? viewportW * 0.92 : 1400);
+        const maxH = Math.min(viewportH * 0.78, isFs ? viewportH * 0.8 : 820);
+        let sw = maxW;
+        let sh = sw / aspect;
+        if (sh > maxH) {
+          sh = maxH;
+          sw = sh * aspect;
+        }
+        return {
+          stageW: Math.max(240, Math.round(sw)),
+          stageH: Math.max(140, Math.round(sh))
+        };
+      };
+
+      const { stageW: initialStageW, stageH: initialStageH } = computeStageDimensions(mountTarget);
 
       this.#modalAbort = new AbortController();
       const { signal } = this.#modalAbort;
@@ -1884,15 +1924,19 @@
 
       const stage = doc.createElement("div");
       stage.className = "dsc-draw-stage";
-      stage.style.width = `${stageW}px`;
-      stage.style.height = `${stageH}px`;
 
       const canvas = doc.createElement("canvas");
       canvas.className = "dsc-draw-stage-canvas";
-      canvas.width = stageW * 2;
-      canvas.height = stageH * 2;
-      canvas.style.width = `${stageW}px`;
-      canvas.style.height = `${stageH}px`;
+
+      const applyStageDimensions = (sw, sh) => {
+        stage.style.width = `${sw}px`;
+        stage.style.height = `${sh}px`;
+        canvas.width = sw * 2;
+        canvas.height = sh * 2;
+        canvas.style.width = `${sw}px`;
+        canvas.style.height = `${sh}px`;
+      };
+      applyStageDimensions(initialStageW, initialStageH);
 
       const selBox = doc.createElement("div");
       selBox.className = "dsc-draw-selection";
@@ -2000,7 +2044,22 @@
         { signal }
       );
 
-      (doc.body || doc.documentElement).appendChild(modal);
+      const syncFullscreenMount = () => {
+        if (!this.isDrawing || this.drawModalEl !== modal) return;
+        const nextTarget = getModalMountTarget(doc);
+        if (nextTarget && modal.parentElement !== nextTarget) {
+          nextTarget.appendChild(modal);
+        }
+        if (nextTarget && !dragging) {
+          const { stageW: nextW, stageH: nextH } = computeStageDimensions(nextTarget);
+          applyStageDimensions(nextW, nextH);
+        }
+      };
+
+      doc.addEventListener("fullscreenchange", syncFullscreenMount, { signal });
+      doc.addEventListener("webkitfullscreenchange", syncFullscreenMount, { signal });
+
+      mountTarget.appendChild(modal);
       this.drawModalEl = modal;
       cancelBtn.focus?.();
       drawPreview();
@@ -2155,6 +2214,7 @@
   // maintaining the `MediaStreamCropSession`, and recalling per-streamer crops.
   class VideoSourceController {
     #listeners = new AbortController();
+    #hostListeners = null;
     #nativeSrcDesc = null;
     #offRemoved = null;
     #hoverTimer = null;
@@ -2218,6 +2278,13 @@
       const immediate = this.video.parentElement;
       if (!immediate) return null;
 
+      const fsEl = getActiveFullscreenElement(this.doc);
+      if (fsEl && fsEl !== this.video && fsEl.contains?.(this.video)) {
+        if (fsEl.querySelectorAll("video").length <= 1) {
+          return fsEl;
+        }
+      }
+
       let best = immediate;
       let cur = immediate;
 
@@ -2246,31 +2313,73 @@
           best = cur;
         }
 
+        if (fsEl && cur === fsEl) break;
         cur = cur.parentElement;
       }
 
       return best;
     }
 
-    mount() {
-      const host = this.resolveHostContainer();
-      if (!host) return;
-      this.host = host;
+    attachHost(nextHost) {
+      if (!nextHost || nextHost === this.host) return;
 
-      const pos = this.win.getComputedStyle(host).position;
+      this.#hostListeners?.abort();
+      this.#hostListeners = null;
+
+      if (this.host) {
+        this.host.classList.remove("dsc-host-hover");
+        if (this.promotedHostPos) {
+          this.host.classList.remove("dsc-host-positioned");
+          this.promotedHostPos = false;
+        }
+      }
+
+      this.host = nextHost;
+      const pos = this.win.getComputedStyle(nextHost).position;
       if (!pos || pos === "static") {
-        host.classList.add("dsc-host-positioned");
+        nextHost.classList.add("dsc-host-positioned");
         this.promotedHostPos = true;
       }
 
+      if (this.overlay.rootEl) {
+        nextHost.appendChild(this.overlay.rootEl);
+        this.watchOverlayRemoval();
+      }
+
+      this.#hostListeners = new AbortController();
+      const hostSignal = typeof AbortSignal !== "undefined" && AbortSignal.any
+        ? AbortSignal.any([this.#listeners.signal, this.#hostListeners.signal])
+        : this.#hostListeners.signal;
+      nextHost.addEventListener("mouseenter", () => this.setHover(true), { signal: hostSignal });
+      nextHost.addEventListener("mousemove", () => this.bumpHover(), { passive: true, signal: hostSignal });
+      nextHost.addEventListener("mouseleave", () => this.setHover(false), { signal: hostSignal });
+    }
+
+    recheckHostContainer() {
+      if (!this.video.isConnected) return;
+      const nextHost = this.resolveHostContainer();
+      if (!nextHost) return;
+      if (nextHost !== this.host) {
+        this.attachHost(nextHost);
+      } else if (this.overlay.rootEl && !this.overlay.rootEl.isConnected) {
+        this.host.appendChild(this.overlay.rootEl);
+        this.watchOverlayRemoval();
+      }
+      this.syncUI();
+    }
+
+    mount() {
+      const host = this.resolveHostContainer();
+      if (!host) return;
+
       this.installVideoSrcHook();
-      host.appendChild(this.overlay.build());
-      this.watchOverlayRemoval();
+      this.overlay.build();
+      this.attachHost(host);
 
       const { signal } = this.#listeners;
-      host.addEventListener("mouseenter", () => this.setHover(true), { signal });
-      host.addEventListener("mousemove", () => this.bumpHover(), { passive: true, signal });
-      host.addEventListener("mouseleave", () => this.setHover(false), { signal });
+      const onFullscreenChange = () => this.recheckHostContainer();
+      this.doc.addEventListener("fullscreenchange", onFullscreenChange, { signal });
+      this.doc.addEventListener("webkitfullscreenchange", onFullscreenChange, { signal });
       this.video.addEventListener("loadedmetadata", () => this.handleStreamMetadata(), { signal });
       this.video.addEventListener("resize", () => this.handleStreamMetadata(), { signal });
 
@@ -2374,9 +2483,17 @@
     }
 
     ensureMounted() {
-      if (!this.host?.isConnected) return;
-      if (this.overlay.rootEl && !this.overlay.rootEl.isConnected) {
-        this.host.appendChild(this.overlay.rootEl);
+      if (!this.host?.isConnected) {
+        this.recheckHostContainer();
+        if (!this.host?.isConnected) return;
+      } else {
+        const resolved = this.resolveHostContainer();
+        if (resolved && resolved !== this.host) {
+          this.attachHost(resolved);
+        } else if (this.overlay.rootEl && !this.overlay.rootEl.isConnected) {
+          this.host.appendChild(this.overlay.rootEl);
+          this.watchOverlayRemoval();
+        }
       }
 
       const current = this.getNativeSrcObject();
@@ -2392,9 +2509,8 @@
       if (!rootEl || this.doc !== document || !this.manager.api.DOM.onRemoved) return;
 
       this.#offRemoved = this.manager.api.DOM.onRemoved(rootEl, () => {
-        if (this.host?.isConnected && this.video.isConnected && this.overlay.rootEl) {
-          this.host.appendChild(this.overlay.rootEl);
-          this.watchOverlayRemoval();
+        if (this.video.isConnected && this.overlay.rootEl) {
+          this.recheckHostContainer();
         }
       });
     }
@@ -2406,6 +2522,8 @@
       clearTimeout(this.#hoverTimer);
       this.#hoverTimer = null;
 
+      this.#hostListeners?.abort();
+      this.#hostListeners = null;
       this.#listeners.abort();
       this.removeVideoSrcHook();
       this.teardownCropSession(true);
@@ -2678,6 +2796,7 @@
 
   StreamCropper.computePixelCropRect = computePixelCropRect;
   StreamCropper.computeSourcePreset = computeSourcePreset;
+  StreamCropper.getModalMountTarget = getModalMountTarget;
   StreamCropper.MediaStreamCropSession = MediaStreamCropSession;
   StreamCropper.isMediaStream = isMediaStream;
   StreamCropper.isCroppedStream = (s) => Boolean(s && CROPPED_STREAMS.has(s));
