@@ -1,0 +1,12 @@
+{
+  "name": "stream-cropper",
+  "version": "1.0.0",
+  "private": true,
+  "description": "BetterDiscord plugin that crops ultrawide and multi-monitor screen shares at the MediaStream source level.",
+  "main": "StreamCropper.plugin.js",
+  "scripts": {
+    "test": "node --test test.mjs"
+  },
+  "author": "msftMyt",
+  "license": "MIT"
+}
