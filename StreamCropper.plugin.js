@@ -537,6 +537,27 @@
     return !region || (region.x <= 0.002 && region.y <= 0.002 && region.w >= 0.996 && region.h >= 0.996);
   }
 
+  function isMediaStream(val, win) {
+    if (!val || typeof val !== "object") return false;
+    return (
+      (typeof MediaStream !== "undefined" && val instanceof MediaStream) ||
+      Boolean(win?.MediaStream && val instanceof win.MediaStream) ||
+      (typeof val.getVideoTracks === "function" && typeof val.getAudioTracks === "function")
+    );
+  }
+
+  function requestAnimFrame(win, cb) {
+    const fn = win?.requestAnimationFrame ?? (typeof requestAnimationFrame === "function" ? requestAnimationFrame : null);
+    return fn ? fn.call(win, cb) : setTimeout(() => cb(Date.now()), 16);
+  }
+
+  function cancelAnimFrame(win, id) {
+    if (!id) return;
+    const fn = win?.cancelAnimationFrame ?? (typeof cancelAnimationFrame === "function" ? cancelAnimationFrame : null);
+    if (fn) fn.call(win, id);
+    else clearTimeout(id);
+  }
+
   // Chromium's VideoFrame visibleRect requires even X/Y/width/height when the
   // underlying WebRTC decoder outputs 4:2:0 (I420 / NV12) planes; odd offsets
   // throw a DOMException on sub-sampled chroma planes. `originX`/`originY`
@@ -608,9 +629,11 @@
     #rafId = 0;
     #onStreamReplaced;
 
-    constructor(sourceStream, initialRegion, { onStreamReplaced = null } = {}) {
+    constructor(sourceStream, initialRegion, { onStreamReplaced = null, doc = document, win = null } = {}) {
       this.sourceStream = sourceStream;
       this.region = normalizeRegion(initialRegion);
+      this.doc = doc || document;
+      this.win = win || this.doc.defaultView || window;
       this.outputStream = null;
       this.mode = "none";
       this.disposed = false;
@@ -618,11 +641,14 @@
       this.#onStreamReplaced = onStreamReplaced;
     }
 
-    static supportsWebCodecs() {
+    static supportsWebCodecs(win = null) {
+      const ProcessorCtor = win?.["MediaStreamTrackProcessor"] ?? (typeof MediaStreamTrackProcessor === "function" ? MediaStreamTrackProcessor : null);
+      const GeneratorCtor = win?.["MediaStreamTrackGenerator"] ?? (typeof MediaStreamTrackGenerator === "function" ? MediaStreamTrackGenerator : null);
+      const FrameCtor = win?.["VideoFrame"] ?? (typeof VideoFrame === "function" ? VideoFrame : null);
       return (
-        typeof MediaStreamTrackProcessor === "function" &&
-        typeof MediaStreamTrackGenerator === "function" &&
-        typeof VideoFrame === "function"
+        typeof ProcessorCtor === "function" &&
+        typeof GeneratorCtor === "function" &&
+        typeof FrameCtor === "function"
       );
     }
 
@@ -633,7 +659,7 @@
 
       const audioTracks = this.sourceStream.getAudioTracks?.() ?? [];
 
-      if (MediaStreamCropSession.supportsWebCodecs()) {
+      if (MediaStreamCropSession.supportsWebCodecs(this.win)) {
         try {
           return this.startWebCodecs(videoTrack, audioTracks);
         } catch (err) {
@@ -649,12 +675,18 @@
     }
 
     startWebCodecs(videoTrack, audioTracks) {
-      const processor = new MediaStreamTrackProcessor({ track: videoTrack });
-      const generator = new MediaStreamTrackGenerator({ kind: "video" });
+      const ProcessorCtor = this.win?.["MediaStreamTrackProcessor"] ?? MediaStreamTrackProcessor;
+      const GeneratorCtor = this.win?.["MediaStreamTrackGenerator"] ?? MediaStreamTrackGenerator;
+      const FrameCtor = this.win?.["VideoFrame"] ?? VideoFrame;
+      const StreamCtor = this.win?.["MediaStream"] ?? MediaStream;
+      const TransformCtor = this.win?.["TransformStream"] ?? TransformStream;
+
+      const processor = new ProcessorCtor({ track: videoTrack });
+      const generator = new GeneratorCtor({ kind: "video" });
       this.#generator = generator;
       this.#abort = new AbortController();
 
-      const transformer = new TransformStream({
+      const transformer = new TransformCtor({
         transform: (frame, controller) => {
           if (this.disposed) {
             frame.close();
@@ -671,7 +703,7 @@
             this.lastOutputSize = { width: rect.width, height: rect.height };
 
             controller.enqueue(
-              new VideoFrame(frame, {
+              new FrameCtor(frame, {
                 visibleRect: rect,
                 timestamp: frame.timestamp,
                 duration: frame.duration ?? undefined
@@ -681,7 +713,7 @@
             // Mid-stream WebRTC resolution shifts can briefly race rect bounds;
             // pass the uncropped frame through so video never freezes.
             try {
-              controller.enqueue(new VideoFrame(frame));
+              controller.enqueue(new FrameCtor(frame));
             } catch {}
           } finally {
             // Unclosed VideoFrames stall Chromium's WebRTC decoder pool after ~16 frames.
@@ -702,14 +734,14 @@
           this.#onStreamReplaced?.(fallback);
         });
 
-      this.outputStream = new MediaStream([generator, ...audioTracks]);
+      this.outputStream = new StreamCtor([generator, ...audioTracks]);
       CROPPED_STREAMS.add(this.outputStream);
       this.mode = "webcodecs";
       return this.outputStream;
     }
 
     startCanvasFallback(audioTracks) {
-      const hiddenVideo = document.createElement("video");
+      const hiddenVideo = this.doc.createElement("video");
       hiddenVideo.dataset.dscInternal = "true";
       hiddenVideo.muted = true;
       hiddenVideo.autoplay = true;
@@ -717,7 +749,7 @@
       hiddenVideo.srcObject = this.sourceStream;
       hiddenVideo.play()?.catch(() => {});
 
-      const canvas = document.createElement("canvas");
+      const canvas = this.doc.createElement("canvas");
       canvas.width = 1280;
       canvas.height = 720;
       const ctx = canvas.getContext("2d", { alpha: false });
@@ -739,7 +771,7 @@
             // Frame not yet decoded on `hiddenVideo`.
           }
         }
-        this.#rafId = requestAnimationFrame(drawTick);
+        this.#rafId = requestAnimFrame(this.win, drawTick);
       };
 
       drawTick();
@@ -775,7 +807,7 @@
       this.#teardownWebCodecsOnly();
 
       if (this.#rafId) {
-        cancelAnimationFrame(this.#rafId);
+        cancelAnimFrame(this.win, this.#rafId);
         this.#rafId = 0;
       }
 
@@ -951,6 +983,8 @@
 
   class StreamCropper {
     #listeners = null;
+    #trackedDocs = new Map();
+    #popoutStore = null;
     #scanTimer = null;
     #rescanInterval = null;
 
@@ -969,7 +1003,8 @@
               load: (key) => BdApi.Data.load(pluginName, key),
               save: (key, val) => BdApi.Data.save(pluginName, key, val)
             },
-            UI: BdApi.UI
+            UI: BdApi.UI,
+            Webpack: BdApi.Webpack
           };
 
       this.store = new CropStore(this.api.Data);
@@ -989,25 +1024,44 @@
       if (this.running) return;
       this.running = true;
 
+      try {
+        const webpackApi = this.api.Webpack ?? (typeof BdApi !== "undefined" ? BdApi.Webpack : null);
+        this.#popoutStore = webpackApi?.getStore?.("PopoutWindowStore") ?? null;
+      } catch (err) {
+        logWarn("Failed to resolve PopoutWindowStore; popout window discovery restricted to iframes.", err);
+        this.#popoutStore = null;
+      }
+
       this.api.DOM.addStyle(STYLES);
-      this.scan();
 
       this.#listeners = new AbortController();
-      const { signal } = this.#listeners;
+      this.bindDocumentEvents(document, window, this.#listeners.signal);
+      this.scan();
 
+      // Discord assigns `video.srcObject` asynchronously after mounting `<video>`,
+      // which does not emit a DOM mutation record.
+      this.#rescanInterval = setInterval(() => {
+        if (this.running) this.scan();
+      }, 1500);
+    }
+
+    bindDocumentEvents(doc, win, signal) {
       const onOutsidePointer = (event) => {
         for (const controller of this.controllers.values()) {
-          controller.handleOutsidePointer(event);
+          if (controller.doc === doc) {
+            controller.handleOutsidePointer(event);
+          }
         }
       };
 
-      document.addEventListener("pointerdown", onOutsidePointer, { capture: true, signal });
-      document.addEventListener("mousedown", onOutsidePointer, { capture: true, signal });
-      window.addEventListener(
+      doc.addEventListener("pointerdown", onOutsidePointer, { capture: true, signal });
+      doc.addEventListener("mousedown", onOutsidePointer, { capture: true, signal });
+      win?.addEventListener?.(
         "keydown",
         (event) => {
           if (event.key !== "Escape") return;
           for (const controller of this.controllers.values()) {
+            if (controller.doc !== doc) continue;
             if (controller.isDrawing) {
               event.stopPropagation();
               event.preventDefault();
@@ -1019,12 +1073,114 @@
         },
         { capture: true, signal }
       );
+    }
 
-      // Discord assigns `video.srcObject` asynchronously after mounting `<video>`,
-      // which does not emit a DOM mutation record.
-      this.#rescanInterval = setInterval(() => {
-        if (this.running) this.scan();
-      }, 1500);
+    collectDocuments() {
+      const docs = [document];
+      const seen = new Set(docs);
+
+      const addWin = (win) => {
+        try {
+          if (!win || win.closed || !win.document) return;
+          const doc = win.document;
+          if (!seen.has(doc)) {
+            seen.add(doc);
+            docs.push(doc);
+          }
+        } catch {
+          // Cross-origin frame access denied.
+        }
+      };
+
+      if (this.#popoutStore && typeof this.#popoutStore.getWindowKeys === "function" && typeof this.#popoutStore.getWindow === "function") {
+        try {
+          const keys = this.#popoutStore.getWindowKeys() ?? [];
+          for (const key of keys) {
+            addWin(this.#popoutStore.getWindow(key));
+          }
+        } catch (err) {
+          logWarn("Failed reading open popout windows from PopoutWindowStore.", err);
+        }
+      }
+
+      for (const iframe of document.querySelectorAll("iframe")) {
+        try {
+          if (iframe.contentWindow) {
+            addWin(iframe.contentWindow);
+          } else if (iframe.contentDocument && !seen.has(iframe.contentDocument)) {
+            seen.add(iframe.contentDocument);
+            docs.push(iframe.contentDocument);
+          }
+        } catch {
+          // Cross-origin iframe; ignore safely.
+        }
+      }
+
+      return docs;
+    }
+
+    ensureSecondaryDocumentTracked(doc) {
+      if (!doc || doc === document || this.#trackedDocs.has(doc)) return;
+      const win = doc.defaultView;
+      if (win?.closed) return;
+
+      const abort = new AbortController();
+      const { signal } = abort;
+
+      let styleEl = doc.getElementById?.(STYLE_ID) ?? null;
+      if (!styleEl) {
+        const styleTarget = doc.head || doc.documentElement;
+        if (styleTarget) {
+          styleEl = doc.createElement("style");
+          styleEl.id = STYLE_ID;
+          styleEl.textContent = STYLES;
+          styleTarget.appendChild(styleEl);
+        }
+      } else {
+        // Don't remove a pre-existing style element we didn't create.
+        styleEl = null;
+      }
+
+      this.bindDocumentEvents(doc, win, signal);
+      win?.addEventListener?.("unload", () => this.cleanupDocument(doc), { once: true, signal });
+
+      let observer = null;
+      const ObserverCtor = win?.MutationObserver ?? (typeof MutationObserver === "function" ? MutationObserver : null);
+      const observeTarget = doc.body || doc.documentElement;
+      if (ObserverCtor && observeTarget) {
+        observer = new ObserverCtor((mutations) => {
+          if (!this.running) return;
+          if (!mutations?.length || mutations.some((m) => m?.addedNodes?.length || m?.removedNodes?.length)) {
+            this.scheduleScan();
+          }
+        });
+        observer.observe(observeTarget, { childList: true, subtree: true });
+      }
+
+      this.#trackedDocs.set(doc, { abort, styleEl, observer });
+    }
+
+    cleanupDocument(doc) {
+      const tracked = this.#trackedDocs.get(doc);
+      if (tracked) {
+        this.#trackedDocs.delete(doc);
+        try {
+          tracked.abort.abort();
+        } catch {}
+        try {
+          tracked.observer?.disconnect?.();
+        } catch {}
+        try {
+          tracked.styleEl?.remove?.();
+        } catch {}
+      }
+
+      for (const [video, controller] of this.controllers) {
+        if (controller.doc === doc || video.ownerDocument === doc) {
+          controller.destroy();
+          this.controllers.delete(video);
+        }
+      }
     }
 
     observer(mutation) {
@@ -1049,6 +1205,12 @@
 
       this.#listeners?.abort();
       this.#listeners = null;
+
+      for (const doc of [...this.#trackedDocs.keys()]) {
+        this.cleanupDocument(doc);
+      }
+      this.#trackedDocs.clear();
+      this.#popoutStore = null;
 
       for (const controller of this.controllers.values()) {
         controller.destroy();
@@ -1122,6 +1284,10 @@
 
     attachTooltip(node, text) {
       if (!node) return null;
+      if (node.ownerDocument && node.ownerDocument !== document) {
+        node.title = text;
+        return null;
+      }
       if (this.api.UI?.createTooltip) {
         try {
           return this.api.UI.createTooltip(node, text, { side: "bottom", style: "primary" });
@@ -1168,7 +1334,10 @@
     isEligibleStreamVideo(video) {
       if (!video || video.nodeName !== "VIDEO" || !video.isConnected) return false;
       if (video.dataset.dscInternal === "true") return false;
-      if (!(video.srcObject instanceof MediaStream)) return false;
+      const doc = video.ownerDocument || document;
+      const win = doc.defaultView || window;
+      if (doc !== document && win?.closed) return false;
+      if (!isMediaStream(video.srcObject, win)) return false;
 
       const rect = video.getBoundingClientRect();
       const width = video.clientWidth || rect.width;
@@ -1180,8 +1349,23 @@
     scan() {
       if (!this.running) return;
 
+      const activeDocs = this.collectDocuments();
+      const activeDocSet = new Set(activeDocs);
+
+      for (const doc of [...this.#trackedDocs.keys()]) {
+        if (!activeDocSet.has(doc) || doc.defaultView?.closed) {
+          this.cleanupDocument(doc);
+        }
+      }
+
+      for (const doc of activeDocs) {
+        if (doc !== document) {
+          this.ensureSecondaryDocumentTracked(doc);
+        }
+      }
+
       for (const [video, controller] of this.controllers) {
-        if (!video.isConnected || !this.isEligibleStreamVideo(video)) {
+        if (!activeDocSet.has(controller.doc) || !video.isConnected || !this.isEligibleStreamVideo(video)) {
           controller.destroy();
           this.controllers.delete(video);
         } else {
@@ -1189,11 +1373,13 @@
         }
       }
 
-      for (const video of document.querySelectorAll("video")) {
-        if (!this.controllers.has(video) && this.isEligibleStreamVideo(video)) {
-          const controller = new VideoSourceController(video, this);
-          controller.mount();
-          this.controllers.set(video, controller);
+      for (const doc of activeDocs) {
+        for (const video of doc.querySelectorAll("video")) {
+          if (!this.controllers.has(video) && this.isEligibleStreamVideo(video)) {
+            const controller = new VideoSourceController(video, this);
+            controller.mount();
+            this.controllers.set(video, controller);
+          }
         }
       }
     }
@@ -1229,6 +1415,8 @@
 
     constructor(controller) {
       this.#controller = controller;
+      this.doc = controller.doc;
+      this.win = controller.win;
       this.isOpen = false;
       this.isDrawing = false;
 
@@ -1247,11 +1435,12 @@
     build() {
       const { signal } = this.#listeners;
       const manager = this.#controller.manager;
+      const doc = this.doc;
 
-      const root = document.createElement("div");
+      const root = doc.createElement("div");
       root.className = "dsc-root";
 
-      const trigger = document.createElement("button");
+      const trigger = doc.createElement("button");
       trigger.type = "button";
       trigger.className = "dsc-trigger";
       trigger.setAttribute("aria-haspopup", "dialog");
@@ -1260,9 +1449,9 @@
       if (tip) this.#tooltips.push(tip);
       trigger.innerHTML = `${ICONS.crop}<span>Crop</span>`;
 
-      const resSpan = document.createElement("span");
+      const resSpan = doc.createElement("span");
       resSpan.className = "dsc-trigger-res";
-      const dotSpan = document.createElement("span");
+      const dotSpan = doc.createElement("span");
       dotSpan.className = "dsc-dot";
       trigger.append(resSpan, dotSpan);
 
@@ -1276,31 +1465,31 @@
         { signal }
       );
 
-      const hud = document.createElement("div");
+      const hud = doc.createElement("div");
       hud.className = "dsc-hud";
       hud.setAttribute("role", "dialog");
       hud.setAttribute("aria-label", "Stream Source Crop");
       shieldPlayerEvents(hud, signal);
 
-      const header = document.createElement("div");
+      const header = doc.createElement("div");
       header.className = "dsc-header";
 
-      const titleWrap = document.createElement("div");
+      const titleWrap = doc.createElement("div");
       titleWrap.className = "dsc-title-wrap";
 
-      const title = document.createElement("span");
+      const title = doc.createElement("span");
       title.className = "dsc-title";
       title.textContent = "Source Crop";
 
-      const meta = document.createElement("span");
+      const meta = doc.createElement("span");
       meta.className = "dsc-meta";
       meta.textContent = "Full Stream";
       titleWrap.append(title, meta);
 
-      const headerBtns = document.createElement("div");
+      const headerBtns = doc.createElement("div");
       headerBtns.className = "dsc-header-btns";
 
-      const resetBtn = document.createElement("button");
+      const resetBtn = doc.createElement("button");
       resetBtn.type = "button";
       resetBtn.className = "dsc-icon-btn dsc-reset-btn";
       resetBtn.title = "Restore uncropped stream";
@@ -1308,7 +1497,7 @@
       resetBtn.innerHTML = `${ICONS.reset}<span>Reset</span>`;
       resetBtn.addEventListener("click", () => this.#controller.reset(), { signal });
 
-      const closeBtn = document.createElement("button");
+      const closeBtn = doc.createElement("button");
       closeBtn.type = "button";
       closeBtn.className = "dsc-icon-btn";
       closeBtn.title = "Close panel";
@@ -1320,7 +1509,7 @@
       header.append(titleWrap, headerBtns);
       hud.appendChild(header);
 
-      const chips = document.createElement("div");
+      const chips = doc.createElement("div");
       chips.className = "dsc-chips";
       const presets = [
         { id: "full", label: "Full", title: "Original uncropped stream" },
@@ -1330,7 +1519,7 @@
         { id: "21:9", label: "21:9", title: "Center 21:9 crop" }
       ];
       for (const preset of presets) {
-        const btn = document.createElement("button");
+        const btn = doc.createElement("button");
         btn.type = "button";
         btn.className = "dsc-chip";
         btn.dataset.preset = preset.id;
@@ -1343,22 +1532,22 @@
       }
       hud.appendChild(chips);
 
-      const minimap = document.createElement("div");
+      const minimap = doc.createElement("div");
       minimap.className = "dsc-minimap";
       minimap.tabIndex = 0;
       minimap.setAttribute("role", "application");
       minimap.setAttribute("aria-label", "Crop region selector — use arrow keys to nudge, +/- to zoom, or drag with mouse");
       minimap.title = "Drag box to pan, drag handles to resize, arrow keys to nudge, or double-click to reset";
 
-      const mmCanvas = document.createElement("canvas");
+      const mmCanvas = doc.createElement("canvas");
       mmCanvas.className = "dsc-minimap-canvas";
       mmCanvas.width = 320;
       mmCanvas.height = 180;
 
-      const box = document.createElement("div");
+      const box = doc.createElement("div");
       box.className = "dsc-minimap-box";
       for (const dir of ["nw", "ne", "sw", "se", "n", "s", "w", "e"]) {
-        const handle = document.createElement("div");
+        const handle = doc.createElement("div");
         handle.className = `dsc-handle dsc-handle-${dir}`;
         handle.dataset.handle = dir;
         box.appendChild(handle);
@@ -1368,17 +1557,17 @@
       this.attachMinimapHandlers(minimap, box, signal);
       hud.appendChild(minimap);
 
-      const footer = document.createElement("div");
+      const footer = doc.createElement("div");
       footer.className = "dsc-footer";
 
-      const drawBtn = document.createElement("button");
+      const drawBtn = doc.createElement("button");
       drawBtn.type = "button";
       drawBtn.className = "dsc-icon-btn dsc-draw-full-btn";
       drawBtn.title = "Draw a custom crop box on the full uncropped frame";
       drawBtn.innerHTML = `${ICONS.draw}<span>Draw Custom Region</span>`;
       drawBtn.addEventListener("click", () => this.openDrawModal(), { signal });
 
-      const saveBtn = document.createElement("button");
+      const saveBtn = doc.createElement("button");
       saveBtn.type = "button";
       saveBtn.className = "dsc-icon-btn dsc-save-btn";
       saveBtn.title = "Save current crop preset";
@@ -1404,7 +1593,7 @@
       footer.append(drawBtn, saveBtn);
       hud.appendChild(footer);
 
-      const savedRow = document.createElement("div");
+      const savedRow = doc.createElement("div");
       savedRow.className = "dsc-saved-row";
       hud.appendChild(savedRow);
 
@@ -1590,8 +1779,8 @@
           const dragSignal = AbortSignal.any
             ? AbortSignal.any([signal, dragAbort.signal])
             : dragAbort.signal;
-          window.addEventListener("mousemove", onMove, { capture: true, signal: dragSignal });
-          window.addEventListener("mouseup", onUp, { capture: true, signal: dragSignal });
+          this.win.addEventListener("mousemove", onMove, { capture: true, signal: dragSignal });
+          this.win.addEventListener("mouseup", onUp, { capture: true, signal: dragSignal });
         },
         { signal }
       );
@@ -1620,15 +1809,15 @@
           this.#lastMinimapTs = ts;
           this.drawMinimap();
         }
-        this.#minimapRaf = requestAnimationFrame(tick);
+        this.#minimapRaf = requestAnimFrame(this.win, tick);
       };
       this.drawMinimap();
-      this.#minimapRaf = requestAnimationFrame(tick);
+      this.#minimapRaf = requestAnimFrame(this.win, tick);
     }
 
     stopMinimapLoop() {
       if (this.#minimapRaf) {
-        cancelAnimationFrame(this.#minimapRaf);
+        cancelAnimFrame(this.win, this.#minimapRaf);
         this.#minimapRaf = 0;
       }
     }
@@ -1655,12 +1844,14 @@
       this.closeHud();
 
       const ctrl = this.#controller;
+      const doc = this.doc;
+      const win = this.win;
       const monitor = isFullRegion(ctrl.region) ? ctrl.video : ctrl.ensureSourceMonitor();
       const dims = ctrl.getOriginalDimensions();
       const aspect = clamp(dims.width / Math.max(1, dims.height), 0.5, 5);
 
-      const maxW = Math.min(window.innerWidth * 0.9, 1400);
-      const maxH = Math.min(window.innerHeight * 0.78, 820);
+      const maxW = Math.min((win.innerWidth || 1920) * 0.9, 1400);
+      const maxH = Math.min((win.innerHeight || 1080) * 0.78, 820);
       let stageW = maxW;
       let stageH = stageW / aspect;
       if (stageH > maxH) {
@@ -1673,40 +1864,40 @@
       this.#modalAbort = new AbortController();
       const { signal } = this.#modalAbort;
 
-      const modal = document.createElement("div");
+      const modal = doc.createElement("div");
       modal.className = "dsc-draw-modal";
       modal.setAttribute("role", "dialog");
       modal.setAttribute("aria-modal", "true");
       modal.setAttribute("aria-label", "Draw custom stream crop region");
       shieldPlayerEvents(modal, signal);
 
-      const bar = document.createElement("div");
+      const bar = doc.createElement("div");
       bar.className = "dsc-draw-modal-bar";
       bar.innerHTML = `<span>Drag across the part of the ${dims.width}×${dims.height} stream you want to watch</span>`;
 
-      const cancelBtn = document.createElement("button");
+      const cancelBtn = doc.createElement("button");
       cancelBtn.type = "button";
       cancelBtn.className = "dsc-icon-btn";
       cancelBtn.textContent = "Cancel (Esc)";
       cancelBtn.addEventListener("click", () => this.closeDrawModal(), { signal });
       bar.appendChild(cancelBtn);
 
-      const stage = document.createElement("div");
+      const stage = doc.createElement("div");
       stage.className = "dsc-draw-stage";
       stage.style.width = `${stageW}px`;
       stage.style.height = `${stageH}px`;
 
-      const canvas = document.createElement("canvas");
+      const canvas = doc.createElement("canvas");
       canvas.className = "dsc-draw-stage-canvas";
       canvas.width = stageW * 2;
       canvas.height = stageH * 2;
       canvas.style.width = `${stageW}px`;
       canvas.style.height = `${stageH}px`;
 
-      const selBox = document.createElement("div");
+      const selBox = doc.createElement("div");
       selBox.className = "dsc-draw-selection";
 
-      const readout = document.createElement("div");
+      const readout = doc.createElement("div");
       readout.className = "dsc-draw-readout";
       selBox.appendChild(readout);
 
@@ -1719,7 +1910,7 @@
         try {
           ctx?.drawImage(monitor, 0, 0, canvas.width, canvas.height);
         } catch {}
-        this.#drawModalRaf = requestAnimationFrame(drawPreview);
+        this.#drawModalRaf = requestAnimFrame(win, drawPreview);
       };
 
       let startX = 0;
@@ -1795,8 +1986,8 @@
           selBox.style.width = "1px";
           selBox.style.height = "1px";
 
-          window.addEventListener("mousemove", onMove, { capture: true, signal });
-          window.addEventListener("mouseup", onUp, { capture: true, signal });
+          win.addEventListener("mousemove", onMove, { capture: true, signal });
+          win.addEventListener("mouseup", onUp, { capture: true, signal });
         },
         { signal }
       );
@@ -1809,7 +2000,7 @@
         { signal }
       );
 
-      document.body.appendChild(modal);
+      (doc.body || doc.documentElement).appendChild(modal);
       this.drawModalEl = modal;
       cancelBtn.focus?.();
       drawPreview();
@@ -1819,7 +2010,7 @@
       if (!this.isDrawing && !this.drawModalEl) return;
       this.isDrawing = false;
       if (this.#drawModalRaf) {
-        cancelAnimationFrame(this.#drawModalRaf);
+        cancelAnimFrame(this.win, this.#drawModalRaf);
         this.#drawModalRaf = 0;
       }
       this.#modalAbort?.abort();
@@ -1913,10 +2104,10 @@
       this.savedRowEl.style.display = "flex";
 
       for (const [idx, item] of list.entries()) {
-        const pill = document.createElement("div");
+        const pill = this.doc.createElement("div");
         pill.className = "dsc-saved-pill";
 
-        const applyBtn = document.createElement("button");
+        const applyBtn = this.doc.createElement("button");
         applyBtn.type = "button";
         applyBtn.className = "dsc-saved-apply";
         applyBtn.textContent = item.name;
@@ -1926,7 +2117,7 @@
           this.#controller.setRegion(item.region);
         });
 
-        const delBtn = document.createElement("button");
+        const delBtn = this.doc.createElement("button");
         delBtn.type = "button";
         delBtn.className = "dsc-saved-del";
         delBtn.textContent = "×";
@@ -1972,6 +2163,8 @@
     constructor(video, manager) {
       this.video = video;
       this.manager = manager;
+      this.doc = video.ownerDocument || document;
+      this.win = this.doc.defaultView || window;
 
       this.originalStream = video.srcObject;
       this.cropSession = null;
@@ -2028,7 +2221,7 @@
       let best = immediate;
       let cur = immediate;
 
-      for (let depth = 0; depth < 8 && cur && cur !== document.body && cur !== document.documentElement; depth++) {
+      for (let depth = 0; depth < 8 && cur && cur !== this.doc.body && cur !== this.doc.documentElement; depth++) {
         if (cur.querySelectorAll("video").length > 1) break;
 
         if (cur !== immediate && cur.children.length > 1) {
@@ -2064,7 +2257,7 @@
       if (!host) return;
       this.host = host;
 
-      const pos = window.getComputedStyle(host).position;
+      const pos = this.win.getComputedStyle(host).position;
       if (!pos || pos === "static") {
         host.classList.add("dsc-host-positioned");
         this.promotedHostPos = true;
@@ -2196,7 +2389,7 @@
       this.#offRemoved?.();
       this.#offRemoved = null;
       const rootEl = this.overlay.rootEl;
-      if (!rootEl || !this.manager.api.DOM.onRemoved) return;
+      if (!rootEl || this.doc !== document || !this.manager.api.DOM.onRemoved) return;
 
       this.#offRemoved = this.manager.api.DOM.onRemoved(rootEl, () => {
         if (this.host?.isConnected && this.video.isConnected && this.overlay.rootEl) {
@@ -2356,7 +2549,7 @@
         return this.sourceMonitorVideo;
       }
 
-      const monitor = document.createElement("video");
+      const monitor = this.doc.createElement("video");
       monitor.dataset.dscInternal = "true";
       monitor.muted = true;
       monitor.autoplay = true;
@@ -2407,6 +2600,8 @@
       if (!this.originalStream || isFullRegion(this.region)) return;
 
       const session = new MediaStreamCropSession(this.originalStream, this.region, {
+        doc: this.doc,
+        win: this.win,
         onStreamReplaced: (fallbackStream) => {
           if (this.cropSession !== session || !this.video.isConnected) return;
           this.setNativeSrcObject(fallbackStream);
@@ -2484,6 +2679,7 @@
   StreamCropper.computePixelCropRect = computePixelCropRect;
   StreamCropper.computeSourcePreset = computeSourcePreset;
   StreamCropper.MediaStreamCropSession = MediaStreamCropSession;
+  StreamCropper.isMediaStream = isMediaStream;
   StreamCropper.isCroppedStream = (s) => Boolean(s && CROPPED_STREAMS.has(s));
 
   if (typeof module !== "undefined" && module.exports) {

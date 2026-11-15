@@ -144,6 +144,7 @@ function createMockDOM({ withWebCodecs = true } = {}) {
       this.nodeName = tagName.toUpperCase();
       this.tagName = this.nodeName;
       this._ownerDoc = ownerDoc;
+      this.ownerDocument = ownerDoc;
       this.parentElement = null;
       this.children = [];
       this.attributes = new Map();
@@ -396,14 +397,30 @@ function createMockDOM({ withWebCodecs = true } = {}) {
 
   const document = new MockDocument();
   const windowTarget = new MockEventTarget();
+  const webCodecsGlobals = withWebCodecs
+    ? {
+        MediaStreamTrackProcessor: MockTrackProcessor,
+        MediaStreamTrackGenerator: MockTrackGenerator,
+        VideoFrame: MockVideoFrame,
+        TransformStream,
+        AbortController
+      }
+    : {};
   const windowObj = Object.assign(windowTarget, {
     document,
+    closed: false,
     innerWidth: 1920,
     innerHeight: 1080,
     HTMLMediaElement: MockHTMLMediaElement,
     MutationObserver: MockMutationObserver,
     MediaStream: MockMediaStream,
     localStorage,
+    requestAnimationFrame: (cb) => {
+      const t = setTimeout(() => cb(Date.now()), 16);
+      t.unref?.();
+      return t;
+    },
+    cancelAnimationFrame: (id) => clearTimeout(id),
     getComputedStyle: (el) => ({
       position: el.classList.contains("dsc-host-positioned")
         ? "relative"
@@ -416,8 +433,10 @@ function createMockDOM({ withWebCodecs = true } = {}) {
       t.unref?.();
       return t;
     },
-    clearInterval
+    clearInterval,
+    ...webCodecsGlobals
   });
+  document.defaultView = windowObj;
 
   function makeEvent(type, props = {}) {
     return {
@@ -447,24 +466,18 @@ function createMockDOM({ withWebCodecs = true } = {}) {
     MediaStream: MockMediaStream,
     localStorage,
     emittedFrames,
-    webCodecsGlobals: withWebCodecs
-      ? {
-          MediaStreamTrackProcessor: MockTrackProcessor,
-          MediaStreamTrackGenerator: MockTrackGenerator,
-          VideoFrame: MockVideoFrame,
-          TransformStream,
-          AbortController
-        }
-      : {},
+    webCodecsGlobals,
     makeEvent
   };
 }
 
-function loadPlugin({ asBetterDiscord = true, withWebCodecs = true, existingEnv = null } = {}) {
+function loadPlugin({ asBetterDiscord = true, withWebCodecs = true, existingEnv = null, popoutWindows = null } = {}) {
   const env = existingEnv || createMockDOM({ withWebCodecs });
   const cjsModule = asBetterDiscord ? { exports: {} } : undefined;
   const bdStyles = new Map();
   const bdData = new Map();
+  const popoutMap = popoutWindows instanceof Map ? popoutWindows : new Map();
+  let getStoreCalls = 0;
 
   const BdApi = asBetterDiscord
     ? {
@@ -479,7 +492,24 @@ function loadPlugin({ asBetterDiscord = true, withWebCodecs = true, existingEnv 
         UI: {
           buildSettingsPanel: (spec) => spec,
           showToast: () => {},
-          createTooltip: () => ({ destroy() {} })
+          createTooltip: (node) => {
+            if (node.ownerDocument !== env.document) {
+              throw new Error("BdApi.UI.createTooltip called on secondary popout document");
+            }
+            return { destroy() {} };
+          }
+        },
+        Webpack: {
+          getStore: (name) => {
+            getStoreCalls++;
+            if (name === "PopoutWindowStore") {
+              return {
+                getWindowKeys: () => [...popoutMap.keys()],
+                getWindow: (key) => popoutMap.get(key) ?? null
+              };
+            }
+            return null;
+          }
         },
         Logger: {
           warn: () => {}
@@ -515,6 +545,8 @@ function loadPlugin({ asBetterDiscord = true, withWebCodecs = true, existingEnv 
     BdApi,
     bdStyles,
     bdData,
+    popoutMap,
+    getWebpackStoreCalls: () => getStoreCalls,
     PluginClass: asBetterDiscord ? cjsModule.exports : env.window.DiscordStreamCropper
   };
 }
@@ -842,6 +874,154 @@ test("6. Async WebCodecs mid-stream error recovery, hardware visibleRect offset 
 
   plugin.stop();
   assert.equal(Boolean(audioTrack.stopped), false, "Original audio track never stopped on plugin teardown");
+});
+
+test("7. Discord Stream Popout Window support: cross-realm MediaStream, style injection, crop recall, modal/tooltip isolation & cleanup", async () => {
+  const popoutWindows = new Map();
+  const { env, PluginClass, getWebpackStoreCalls } = loadPlugin({
+    asBetterDiscord: true,
+    withWebCodecs: true,
+    popoutWindows
+  });
+  const plugin = new PluginClass();
+  plugin.start();
+  assert.equal(getWebpackStoreCalls(), 1, "PopoutWindowStore resolved once on start() and cached");
+
+  // 1) Streamer plays in main window and user crops to "Right" (5120x1440 -> 2560x1440 at x=2560)
+  const mainTrack = {
+    id: "main-popout-track",
+    kind: "video",
+    getSettings: () => ({ width: 5120, height: 1440 })
+  };
+  const mainStream = Object.assign(new env.MediaStream([mainTrack]), { id: "stream-popout-streamer" });
+
+  const mainStage = env.document.createElement("div");
+  mainStage.style.position = "relative";
+  mainStage.clientWidth = 1600;
+  mainStage.clientHeight = 900;
+  const mainBadge = env.document.createElement("span");
+  mainBadge.textContent = "ultrawide-gamer";
+  mainStage.appendChild(mainBadge);
+
+  const mainVideo = env.document.createElement("video");
+  mainVideo.srcObject = mainStream;
+  mainVideo.clientWidth = 1600;
+  mainVideo.clientHeight = 450;
+  mainVideo.videoWidth = 5120;
+  mainVideo.videoHeight = 1440;
+  mainStage.appendChild(mainVideo);
+  env.document.body.appendChild(mainStage);
+
+  plugin.scan();
+
+  const mainHud = mainStage.querySelector(".dsc-hud");
+  const rightBtn = mainHud.querySelectorAll("button").find((b) => b.dataset.preset === "right");
+  rightBtn.dispatchEvent(env.makeEvent("click"));
+  assert.equal(PluginClass.isCroppedStream(mainVideo.srcObject), true, "Main window stream cropped");
+
+  // 2) User pops out the stream into a separate Electron BrowserWindow (distinct Document, Window & MediaStream realm!)
+  mainStage.remove();
+  const popoutEnv = createMockDOM({ withWebCodecs: true });
+  assert.notEqual(popoutEnv.MediaStream, env.MediaStream, "Popout window has its own distinct MediaStream constructor");
+  popoutWindows.set("DISCORD_CALL_POPOUT", popoutEnv.window);
+
+  const popoutVideoTrack = {
+    id: "popout-video-track",
+    kind: "video",
+    getSettings: () => ({ width: 5120, height: 1440 })
+  };
+  const popoutAudioTrack = { id: "popout-audio-track", kind: "audio" };
+  const popoutRawStream = Object.assign(
+    new popoutEnv.MediaStream([popoutVideoTrack, popoutAudioTrack]),
+    { id: "popout-stream-id" }
+  );
+  assert.equal(popoutRawStream instanceof env.MediaStream, false, "Cross-realm stream is not instanceof main MediaStream");
+  assert.equal(PluginClass.isMediaStream(popoutRawStream, popoutEnv.window), true, "isMediaStream recognizes cross-realm stream");
+
+  const popoutStage = popoutEnv.document.createElement("div");
+  popoutStage.clientWidth = 1280;
+  popoutStage.clientHeight = 720;
+  const popoutBadge = popoutEnv.document.createElement("span");
+  popoutBadge.textContent = "ultrawide-gamer";
+  popoutStage.appendChild(popoutBadge);
+
+  const popoutVideo = popoutEnv.document.createElement("video");
+  popoutVideo.srcObject = popoutRawStream;
+  popoutVideo.clientWidth = 1280;
+  popoutVideo.clientHeight = 720;
+  popoutVideo.videoWidth = 5120;
+  popoutVideo.videoHeight = 1440;
+  popoutStage.appendChild(popoutVideo);
+  popoutEnv.document.body.appendChild(popoutStage);
+
+  plugin.scan();
+  assert.equal(getWebpackStoreCalls(), 1, "PopoutWindowStore never re-queried during scan()");
+
+  // 3) Style sheet injected into popout's <head> & tooltip fell back cleanly to `title`
+  const popoutStyle = popoutEnv.document.head.querySelector("#dsc-stream-cropper-styles");
+  assert.ok(popoutStyle, "Stylesheet injected into popout document <head>");
+  assert.equal(popoutStyle.ownerDocument, popoutEnv.document);
+
+  const popoutTrigger = popoutStage.querySelector(".dsc-trigger");
+  assert.ok(popoutTrigger, "Crop trigger mounted inside popout document");
+  assert.equal(popoutTrigger.ownerDocument, popoutEnv.document, "Overlay DOM created via popout ownerDocument");
+  assert.equal(popoutTrigger.title, "Crop stream source", "Popout trigger uses native title instead of main-doc BdApi tooltip");
+
+  // 4) Auto-recalled the streamer's "Right" crop from the main window using popout's MediaStream realm!
+  const popoutCroppedStream = popoutVideo.srcObject;
+  assert.notEqual(popoutCroppedStream, popoutRawStream, "Popout video.srcObject replaced with cropped stream");
+  assert.equal(PluginClass.isCroppedStream(popoutCroppedStream), true);
+  assert.equal(popoutCroppedStream instanceof popoutEnv.MediaStream, true, "Output stream constructed with popout window's MediaStream");
+
+  const rawPopoutFrame = popoutVideoTrack._pushFrame(5120, 1440, 99000);
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(rawPopoutFrame.closed, true);
+  assert.equal(popoutEnv.emittedFrames.length, 1);
+  assert.deepEqual(
+    { ...popoutEnv.emittedFrames[0].visibleRect },
+    { x: 2560, y: 0, width: 2560, height: 1440 },
+    "Recalled exact Right 2560x1440 crop in popout window"
+  );
+
+  // 5) Draw Custom Region modal & Escape key operate inside popout window/document, not main document
+  popoutTrigger.dispatchEvent(popoutEnv.makeEvent("click"));
+  const popoutDrawBtn = popoutStage.querySelector(".dsc-draw-full-btn");
+  popoutDrawBtn.dispatchEvent(popoutEnv.makeEvent("click"));
+  assert.ok(popoutEnv.document.body.querySelector(".dsc-draw-modal"), "Draw modal appended to popout document.body");
+  assert.equal(env.document.body.querySelector(".dsc-draw-modal"), null, "Main document untouched by popout modal");
+
+  popoutEnv.window.dispatchEvent(popoutEnv.makeEvent("keydown", { key: "Escape" }));
+  assert.equal(popoutEnv.document.body.querySelector(".dsc-draw-modal"), null, "Escape on popout window closed popout draw modal");
+
+  // 6) Closing popout window cleans up popout styles, observers, listeners, and controllers
+  popoutEnv.window.closed = true;
+  popoutEnv.window.dispatchEvent(popoutEnv.makeEvent("unload"));
+  assert.equal(popoutEnv.document.getElementById("dsc-stream-cropper-styles"), null, "Popout stylesheet removed on unload");
+  assert.equal(popoutEnv.document._observers.size, 0, "Popout MutationObserver disconnected");
+  assert.equal(popoutStage.querySelector(".dsc-trigger"), null, "Popout controller destroyed");
+  assert.equal(popoutVideo.srcObject, popoutRawStream, "Original popout stream restored cleanly");
+
+  // 7) Also verify stop() cleans up an active popout window if still open when plugin stops
+  const popoutEnv2 = createMockDOM({ withWebCodecs: false });
+  popoutWindows.set("DISCORD_CALL_POPOUT_2", popoutEnv2.window);
+  const stage2 = popoutEnv2.document.createElement("div");
+  stage2.clientWidth = 1280;
+  stage2.clientHeight = 720;
+  const video2 = popoutEnv2.document.createElement("video");
+  video2.srcObject = new popoutEnv2.MediaStream([{ kind: "video" }]);
+  video2.clientWidth = 1280;
+  video2.clientHeight = 720;
+  stage2.appendChild(video2);
+  popoutEnv2.document.body.appendChild(stage2);
+
+  plugin.scan();
+  assert.ok(popoutEnv2.document.getElementById("dsc-stream-cropper-styles"));
+  assert.ok(stage2.querySelector(".dsc-trigger"));
+
+  plugin.stop();
+  assert.equal(popoutEnv2.document.getElementById("dsc-stream-cropper-styles"), null, "stop() removed active popout stylesheet");
+  assert.equal(popoutEnv2.document._observers.size, 0, "stop() disconnected active popout observer");
+  assert.equal(stage2.querySelector(".dsc-trigger"), null, "stop() destroyed active popout controller");
 });
 
 
