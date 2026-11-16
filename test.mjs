@@ -186,7 +186,7 @@ function createMockDOM({ withWebCodecs = true } = {}) {
 
     get textContent() {
       if (this.children.length === 0) return this._textContent || "";
-      return this.children.map((c) => c.textContent).join(" ");
+      return this.children.map((c) => c.textContent).join("");
     }
     set textContent(val) {
       this._textContent = String(val ?? "");
@@ -245,12 +245,22 @@ function createMockDOM({ withWebCodecs = true } = {}) {
         if (n && typeof n === "object") this.appendChild(n);
       }
     }
-    focus() {}
+    focus() {
+      if (this._ownerDoc) {
+        this._ownerDoc.activeElement = this;
+      }
+    }
     appendChild(child) {
       if (child.parentElement) child.parentElement.removeChild(child);
       child.parentElement = this;
-      child._ownerDoc = this._ownerDoc;
-      child.ownerDocument = this.ownerDocument;
+      const syncOwnerDoc = (node, doc) => {
+        node._ownerDoc = doc;
+        node.ownerDocument = doc;
+        for (const sub of node.children || []) {
+          syncOwnerDoc(sub, doc);
+        }
+      };
+      syncOwnerDoc(child, this.ownerDocument);
       this.children.push(child);
       this._ownerDoc._notifyMutation();
       return child;
@@ -328,6 +338,7 @@ function createMockDOM({ withWebCodecs = true } = {}) {
       this._observers = new Set();
       this.fullscreenElement = null;
       this.webkitFullscreenElement = null;
+      this.activeElement = null;
       this.documentElement = new MockElement("html", this);
       this.head = new MockElement("head", this);
       this.body = new MockElement("body", this);
@@ -570,6 +581,7 @@ function loadPlugin({ asBetterDiscord = true, withWebCodecs = true, existingEnv 
     MutationObserver: env.window.MutationObserver,
     MediaStream: env.MediaStream,
     AbortController,
+    AbortSignal,
     requestAnimationFrame: (cb) => setTimeout(() => cb(Date.now()), 16),
     cancelAnimationFrame: (id) => clearTimeout(id),
     localStorage: env.localStorage,
@@ -1848,4 +1860,308 @@ test("12. Crop removal (Reset) persistence, legacy ultrawide-res purge, autoCent
   assert.equal(PluginClass.isCroppedStream(vidBravoCheck.srcObject), true, "bravo-uw retained its custom crop independently!");
 
   plugin.stop();
+});
+
+test("13. Deep audit regressions: zero-reset srcObject hook, CropStore tail slice, audio-first/ended tracks, cross-streamer & handoff isolation, Escape in Fullscreen HUD, settings reactivity, mid-drag abort & standalone mode", async () => {
+  // A) Standalone non-BetterDiscord fallback mode (`asBetterDiscord: false`) works without global `BdApi`
+  const standalone = loadPlugin({ asBetterDiscord: false, withWebCodecs: true });
+  assert.equal(typeof standalone.PluginClass, "function", "Exports window.DiscordStreamCropper when CommonJS module is absent");
+  const standaloneInstance = new standalone.PluginClass();
+  standaloneInstance.start();
+  assert.ok(standalone.env.document.getElementById("dsc-stream-cropper-styles"), "Fallback DOM style injection works without BdApi");
+  standaloneInstance.stop();
+  assert.equal(standalone.env.document.getElementById("dsc-stream-cropper-styles"), null);
+
+  // B) CropStore constructor keeps the NEWEST presets & rememberedCrops (`.slice(-MAX)` instead of `.slice(0, MAX)`)
+  const popoutWindows = new Map();
+  const { env, PluginClass, bdData } = loadPlugin({
+    asBetterDiscord: true,
+    withWebCodecs: true,
+    popoutWindows
+  });
+
+  const manyPresets = Array.from({ length: 9 }, (_, i) => ({
+    name: `Preset ${i + 1}`,
+    region: { x: 0.1, y: 0.1, w: 0.5, h: 0.5 }
+  }));
+  const manyRemembered = Array.from({ length: 105 }, (_, i) => ({
+    key: `streamer:user-${i + 1}`,
+    region: { x: 0.25, y: 0, w: 0.5, h: 1 },
+    preset: "center",
+    updatedAt: i + 1
+  }));
+  bdData.set("StreamCropper:config", {
+    settings: { rememberPerStreamer: true, autoCenterUltrawide: false },
+    presets: manyPresets,
+    rememberedCrops: manyRemembered
+  });
+
+  const plugin = new PluginClass();
+  assert.equal(plugin.savedPresets.length, 6);
+  assert.equal(plugin.savedPresets[5].name, "Preset 9", "Kept newest saved presets on reload");
+  assert.equal(plugin.savedPresets[0].name, "Preset 4", "Dropped oldest overflow presets");
+  const recalledNewest = plugin.recallStreamCrop({
+    sessionKeys: [],
+    streamerKeys: ["streamer:user-105"],
+    fallbackKeys: [],
+    persistentKeys: ["streamer:user-105"]
+  });
+  assert.ok(recalledNewest && !recalledNewest.isReset, "Kept newest remembered crop #105 on reload");
+
+  // Clear presets to test collision-free auto-naming (`Crop 1`, `Crop 2`, delete `Crop 1` -> next is `Crop 1`, not duplicate `Crop 2`!)
+  while (plugin.savedPresets.length) plugin.deletePreset(0);
+  plugin.start();
+
+  // C) Redundant React `video.srcObject = originalStream` re-renders do NOT re-invoke native `srcObject` setter when cropped stream is already attached
+  let nativeSrcSetCount = 0;
+  const origDesc = Object.getOwnPropertyDescriptor(env.HTMLMediaElement.prototype, "srcObject");
+  Object.defineProperty(env.HTMLMediaElement.prototype, "srcObject", {
+    configurable: true,
+    enumerable: true,
+    get: origDesc.get,
+    set(val) {
+      if (this.tagName === "VIDEO" && !this.dataset?.dscInternal) {
+        nativeSrcSetCount++;
+      }
+      origDesc.set.call(this, val);
+    }
+  });
+
+  // D) Ended track at index 0 + live track at index 1, AND possessive `' Screen` header (`Chris' Screen`) + noise filtering (`120 FPS`, `AV1`)
+  const endedTrack = { id: "dead-track-0", kind: "video", readyState: "ended", getSettings: () => ({ width: 1920, height: 1080 }) };
+  const liveTrack = { id: "live-track-1", kind: "video", readyState: "live", getSettings: () => ({ width: 5120, height: 1440 }) };
+  const streamChris = Object.assign(new env.MediaStream([endedTrack, liveTrack]), { id: "chris-stream" });
+
+  const shellChris = env.document.createElement("div");
+  shellChris.clientWidth = 1600;
+  shellChris.clientHeight = 940;
+  const headerChris = env.document.createElement("div");
+  headerChris.clientWidth = 1600;
+  headerChris.clientHeight = 40;
+  const headerTitle = env.document.createElement("span");
+  headerTitle.textContent = "Gaming Lobby • Chris' Screen";
+  headerChris.appendChild(headerTitle);
+  shellChris.appendChild(headerChris);
+
+  const stageChris = env.document.createElement("div");
+  stageChris.clientWidth = 1600;
+  stageChris.clientHeight = 900;
+  for (const noise of ["120 FPS", "AV1", "Click to unmute", "Valorant"]) {
+    const pill = env.document.createElement("span");
+    pill.textContent = noise;
+    stageChris.appendChild(pill);
+  }
+  const videoChris = env.document.createElement("video");
+  videoChris.srcObject = streamChris;
+  videoChris.clientWidth = 1600;
+  videoChris.clientHeight = 450;
+  videoChris.videoWidth = 5120;
+  videoChris.videoHeight = 1440;
+  stageChris.appendChild(videoChris);
+  shellChris.appendChild(stageChris);
+  env.document.body.appendChild(shellChris);
+
+  plugin.scan();
+  const ctrlChris = plugin.controllers.get(videoChris);
+  assert.ok(ctrlChris, "Mounted controller on Chris's stage");
+
+  // Open HUD, crop to Center: selects `liveTrack` (index 1), skips `endedTrack` (index 0), and uses WebCodecs!
+  const triggerChris = stageChris.querySelector(".dsc-trigger");
+  triggerChris.dispatchEvent(env.makeEvent("click"));
+  assert.equal(ctrlChris.isOpen, true);
+  stageChris.querySelectorAll("button").find((b) => b.dataset.preset === "center").dispatchEvent(env.makeEvent("click"));
+  assert.equal(ctrlChris.cropSession.mode, "webcodecs", "Selected live video track #1 instead of throwing on ended track #0");
+
+  const setCountAfterCrop = nativeSrcSetCount;
+  // Simulate 5 Discord React re-renders setting `videoChris.srcObject = streamChris`
+  for (let r = 0; r < 5; r++) {
+    videoChris.srcObject = streamChris;
+  }
+  assert.equal(nativeSrcSetCount, setCountAfterCrop, "Zero redundant native srcObject resets across React re-renders!");
+
+  // Verify cross-streamer isolation: `"Chris' Screen"` header extracted ONLY `"chris"`, NOT `"valorant"` or `"120 fps"`!
+  const savedKeys = bdData.get("StreamCropper:config").rememberedCrops.map((c) => c.key);
+  assert.ok(savedKeys.includes("streamer:chris"), "Extracted possessive header name ending in s ('Chris\\' Screen' -> 'chris')");
+  assert.ok(savedKeys.includes("streamer:chris|5120x1440"));
+  assert.equal(savedKeys.some((k) => k.includes("valorant") || k.includes("120 fps") || k.includes("av1")), false, "Did not cross-pollute streamerKeys with game/FPS pills!");
+  // Resolution-specific key sits AFTER generic key so exact resolution wins on recall
+  assert.ok(
+    savedKeys.indexOf("streamer:chris|5120x1440") > savedKeys.indexOf("streamer:chris"),
+    "Resolution-specific key stored after generic key so exact WxH match wins"
+  );
+
+  // E) Pressing `Escape` while HUD is open inside Fullscreen closes HUD, restores focus to trigger, and stops propagation before exiting Fullscreen!
+  env.document.fullscreenElement = stageChris;
+  let fullscreenExited = false;
+  const externalFsListener = (e) => {
+    if (e.key === "Escape") fullscreenExited = true;
+  };
+  env.window.addEventListener("keydown", externalFsListener, { capture: true });
+  const escHudEvent = env.makeEvent("keydown", { key: "Escape" });
+  stageChris.dispatchEvent(escHudEvent);
+  env.window.removeEventListener("keydown", externalFsListener, { capture: true });
+  env.document.fullscreenElement = null;
+
+  assert.equal(ctrlChris.isOpen, false, "Escape closed open HUD");
+  assert.equal(escHudEvent.defaultPrevented, true, "Escape preventDefault() called when closing open HUD");
+  assert.equal(fullscreenExited, false, "stopImmediatePropagation prevented Fullscreen exit on Escape");
+  assert.equal(env.document.activeElement, triggerChris, "Focus restored to Crop trigger button");
+
+  // F) Minimap `mousedown` focuses minimap despite `preventDefault()`, preset auto-naming avoids collisions, and wheel/keydown debounce disk writes
+  triggerChris.dispatchEvent(env.makeEvent("click"));
+  const minimap = stageChris.querySelector(".dsc-minimap");
+  minimap._rect = { left: 0, top: 0, width: 312, height: 90 };
+  const minimapBox = stageChris.querySelector(".dsc-minimap-box");
+  minimap.dispatchEvent(env.makeEvent("mousedown", { button: 0, clientX: 150, clientY: 45, target: minimapBox }));
+  assert.equal(env.document.activeElement, minimap, "Clicking minimap explicitly focuses it for keyboard arrow nudging");
+  env.window.dispatchEvent(env.makeEvent("mouseup", { clientX: 150, clientY: 45 }));
+
+  // Nudge to custom region & save 2 presets -> delete first -> save another -> no collision!
+  let wheelSaves = 0;
+  const rawSave = plugin.api.Data.save;
+  plugin.api.Data.save = (k, v) => {
+    wheelSaves++;
+    return rawSave(k, v);
+  };
+  minimap.dispatchEvent(env.makeEvent("keydown", { key: "ArrowLeft" }));
+  minimap.dispatchEvent(env.makeEvent("keydown", { key: "ArrowLeft" }));
+  minimap.dispatchEvent(env.makeEvent("wheel", { deltaY: -100 }));
+  assert.equal(wheelSaves, 0, "Rapid wheel/keydown nudges debounced without synchronous disk thrashing");
+  plugin.store.flushPendingSave();
+  assert.equal(wheelSaves, 1, "Debounced wheel/keydown updates flushed in a single disk write");
+
+  const saveBtn = stageChris.querySelector(".dsc-save-btn");
+  saveBtn.dispatchEvent(env.makeEvent("click")); // Crop 1
+  minimap.dispatchEvent(env.makeEvent("keydown", { key: "ArrowRight" }));
+  saveBtn.dispatchEvent(env.makeEvent("click")); // Crop 2
+  assert.deepEqual(plugin.savedPresets.map((p) => p.name), ["Crop 1", "Crop 2"]);
+  plugin.deletePreset(0); // Deletes "Crop 1", leaving ["Crop 2"] (`length === 1`)
+  minimap.dispatchEvent(env.makeEvent("keydown", { key: "ArrowRight" }));
+  saveBtn.dispatchEvent(env.makeEvent("click")); // Must pick unused "Crop 1", NOT overwrite "Crop 2"!
+  assert.equal(plugin.savedPresets.length, 2, "Did not overwrite 'Crop 2' after deleting 'Crop 1'");
+
+  // G) Settings live reactivity: changing `defaultSliceAspect` updates active `center` slice immediately!
+  stageChris.querySelectorAll("button").find((b) => b.dataset.preset === "center").dispatchEvent(env.makeEvent("click"));
+  const widthAt16x9 = ctrlChris.region.w;
+  const settingsSpec = plugin.getSettingsPanel();
+  settingsSpec.onChange(null, "defaultSliceAspect", "21:9");
+  assert.ok(ctrlChris.region.w > widthAt16x9 + 0.1, "Changing defaultSliceAspect live-recomputed active Center crop region");
+  settingsSpec.onChange(null, "defaultSliceAspect", "16:9");
+
+  // H) Async WebCodecs fallback picks up audio tracks added AFTER `start()` (not stale t=0 snapshot)
+  const lateStreamAudio = { id: "late-wc-audio", kind: "audio" };
+  streamChris.addTrack(lateStreamAudio);
+  streamChris.dispatchEvent(env.makeEvent("addtrack", { track: lateStreamAudio }));
+  liveTrack._failStream(new Error("Simulated decoder reset"));
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(ctrlChris.cropSession.mode, "canvas", "Switched to canvas fallback");
+  assert.equal(videoChris.srcObject.getAudioTracks().includes(lateStreamAudio), true, "Canvas fallback preserved late-arriving audio track!");
+
+  // I) `#recentHandoff` does NOT leak `chris`'s crop onto a DIFFERENT streamer's unbadged/loading Popout!
+  shellChris.remove();
+  plugin.scan(); // Records handoff for `streamer: "chris"` (`sourceIsPopout: false`)
+
+  const popoutOtherEnv = createMockDOM({ withWebCodecs: true });
+  popoutWindows.set("OTHER_POPOUT", popoutOtherEnv.window);
+  const popoutOtherStage = popoutOtherEnv.document.createElement("div");
+  popoutOtherStage.clientWidth = 1280;
+  popoutOtherStage.clientHeight = 720;
+  const popoutOtherVideo = popoutOtherEnv.document.createElement("video");
+  const otherRawStream = Object.assign(new popoutOtherEnv.MediaStream([{ id: "other-track", kind: "video", readyState: "live" }]), {
+    id: "other-stream"
+  });
+  popoutOtherVideo.srcObject = otherRawStream;
+  popoutOtherVideo.clientWidth = 1280;
+  popoutOtherVideo.clientHeight = 720;
+  popoutOtherVideo.videoWidth = 0; // Unbadged & 0x0 before metadata loads!
+  popoutOtherVideo.videoHeight = 0;
+  popoutOtherStage.appendChild(popoutOtherVideo);
+  popoutOtherEnv.document.body.appendChild(popoutOtherStage);
+
+  plugin.scan();
+  assert.equal(popoutOtherVideo.srcObject, otherRawStream, "Did NOT leak Chris's crop onto a different streamer's loading popout!");
+  popoutWindows.clear();
+  popoutOtherEnv.window.closed = true;
+  plugin.scan();
+
+  // J) Audio-first WebRTC stream (`0` initial video tracks) followed by delayed `addtrack` (`kind: "video"`) + standalone 16:9 mini-player eligibility!
+  const miniHost16x9 = env.document.createElement("div");
+  miniHost16x9.clientWidth = 240;
+  miniHost16x9.clientHeight = 135;
+  const miniBadge = env.document.createElement("span");
+  miniBadge.textContent = "chris";
+  miniHost16x9.appendChild(miniBadge);
+
+  const audioOnlyFirstStream = Object.assign(new env.MediaStream([{ id: "a-first", kind: "audio", readyState: "live" }]), {
+    id: "chris-audio-first"
+  });
+  const miniVid = env.document.createElement("video");
+  miniVid.srcObject = audioOnlyFirstStream;
+  miniVid.clientWidth = 240;
+  miniVid.clientHeight = 135;
+  miniHost16x9.appendChild(miniVid);
+  env.document.body.appendChild(miniHost16x9);
+
+  plugin.scan();
+  const miniCtrl = plugin.controllers.get(miniVid);
+  assert.ok(miniCtrl, "Standalone 240x135 mini-player mounted controller");
+  assert.equal(miniVid.srcObject, audioOnlyFirstStream, "Attached raw stream cleanly while awaiting delayed video track");
+
+  // Now WebRTC negotiates the video track via `addtrack` -> automatically builds WebCodecs crop session!
+  const delayedVidTrack = { id: "v-delayed", kind: "video", readyState: "live", getSettings: () => ({ width: 5120, height: 1440 }) };
+  audioOnlyFirstStream.addTrack(delayedVidTrack);
+  audioOnlyFirstStream.dispatchEvent(env.makeEvent("addtrack", { track: delayedVidTrack }));
+  assert.equal(PluginClass.isCroppedStream(miniVid.srcObject), true, "Delayed video addtrack automatically activated recalled crop!");
+  miniHost16x9.remove();
+  plugin.scan();
+
+  // K) `autoCenterUltrawide` mid-stream aspect shift: 32:9 -> 16:9 auto-reverts to full stream!
+  settingsSpec.onChange(null, "autoCenterUltrawide", true);
+  const shiftStage = env.document.createElement("div");
+  shiftStage.clientWidth = 1280;
+  shiftStage.clientHeight = 720;
+  const shiftBadge = env.document.createElement("span");
+  shiftBadge.textContent = "dynamic-streamer";
+  shiftStage.appendChild(shiftBadge);
+  let dynamicDims = { width: 5120, height: 1440 };
+  const shiftTrack = { id: "shift-track", kind: "video", readyState: "live", getSettings: () => ({ ...dynamicDims }) };
+  const shiftRaw = new env.MediaStream([shiftTrack]);
+  const shiftVideo = env.document.createElement("video");
+  shiftVideo.srcObject = shiftRaw;
+  shiftVideo.clientWidth = 1280;
+  shiftVideo.clientHeight = 720;
+  shiftVideo.videoWidth = 5120;
+  shiftVideo.videoHeight = 1440;
+  shiftStage.appendChild(shiftVideo);
+  env.document.body.appendChild(shiftStage);
+
+  plugin.scan();
+  assert.equal(PluginClass.isCroppedStream(shiftVideo.srcObject), true, "Auto-centered 32:9 stream");
+
+  // Streamer switches screen share from 32:9 monitor to a 1920x1080 game window on the same track!
+  dynamicDims = { width: 1920, height: 1080 };
+  shiftTrack._pushFrame(1920, 1080, 5000);
+  await new Promise((r) => setTimeout(r, 25));
+  assert.equal(shiftVideo.srcObject, shiftRaw, "Auto-reverted auto-center when streamer switched from 32:9 to 16:9 mid-stream!");
+
+  // L) Mid-drag controller teardown aborts window drag listeners cleanly (no zombie sessions or post-stop saves)
+  const dragCtrl = plugin.controllers.get(shiftVideo);
+  const dragTrigger = shiftStage.querySelector(".dsc-trigger");
+  dragTrigger.dispatchEvent(env.makeEvent("click"));
+  const dragMinimap = shiftStage.querySelector(".dsc-minimap");
+  dragMinimap._rect = { left: 0, top: 0, width: 312, height: 176 };
+  dragMinimap.dispatchEvent(env.makeEvent("mousedown", { button: 0, clientX: 20, clientY: 20, target: dragMinimap }));
+
+  plugin.stop();
+  let savesAfterStop = 0;
+  plugin.api.Data.save = () => {
+    savesAfterStop++;
+  };
+  env.window.dispatchEvent(env.makeEvent("mousemove", { clientX: 220, clientY: 140 }));
+  env.window.dispatchEvent(env.makeEvent("mouseup", { clientX: 220, clientY: 140 }));
+  assert.equal(dragCtrl.cropSession, null, "No zombie cropSession spawned by mousemove after plugin.stop()");
+  assert.equal(savesAfterStop, 0, "No post-stop disk writes from mid-drag mouseup");
+
+  // Restore prototype descriptor
+  Object.defineProperty(env.HTMLMediaElement.prototype, "srcObject", origDesc);
 });
