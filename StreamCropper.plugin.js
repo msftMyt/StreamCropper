@@ -1305,8 +1305,8 @@
       const existing = this.#trackedDocs.get(doc);
       if (existing) {
         // Discord's WindowPortal clears or clones `<head>` stylesheets asynchronously
-        // after `window.open`; re-verify our `<style>` is still connected every scan!
-        if (!existing.styleEl?.isConnected) {
+        // after `window.open`; re-verify our `<style>` is still in `doc` every scan!
+        if (!existing.styleEl?.isConnected || !doc.getElementById?.(STYLE_ID)) {
           existing.styleEl = this.ensureSecondaryDocumentStyles(doc);
         }
         return;

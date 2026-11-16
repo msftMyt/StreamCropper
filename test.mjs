@@ -192,6 +192,9 @@ function createMockDOM({ withWebCodecs = true } = {}) {
     }
     set innerHTML(val) {
       this._innerHTML = String(val || "");
+      for (const child of this.children) {
+        child.parentElement = null;
+      }
       this.children = [];
     }
 
@@ -232,6 +235,8 @@ function createMockDOM({ withWebCodecs = true } = {}) {
     appendChild(child) {
       if (child.parentElement) child.parentElement.removeChild(child);
       child.parentElement = this;
+      child._ownerDoc = this._ownerDoc;
+      child.ownerDocument = this.ownerDocument;
       this.children.push(child);
       this._ownerDoc._notifyMutation();
       return child;
@@ -1369,6 +1374,7 @@ test("10. React WindowPortal adopting existing <video> into Popout Window (and w
   popoutEnv.document.body.appendChild(popoutStage);
 
   video._ownerDoc = popoutEnv.document;
+  video.ownerDocument = popoutEnv.document;
   popoutStage.appendChild(video);
 
   plugin.scan();
@@ -1376,7 +1382,7 @@ test("10. React WindowPortal adopting existing <video> into Popout Window (and w
   // 1) Old main-document controller was replaced by a popout-document controller
   const popoutRoot = popoutStage.querySelector(".dsc-root");
   assert.ok(popoutRoot, "Fresh overlay mounted inside popout stage");
-  assert.equal(popoutRoot.ownerDocument, popoutEnv.document, "Overlay elements belong to popout document");
+  assert.equal(popoutRoot.ownerDocument === popoutEnv.document, true, "Overlay elements belong to popout document");
   assert.ok(popoutEnv.document.getElementById("dsc-stream-cropper-styles"), "Stylesheet injected into popout <head>");
   assert.ok(popoutRoot.querySelector("style"), "Local fallback <style> embedded inside popout .dsc-root");
 
