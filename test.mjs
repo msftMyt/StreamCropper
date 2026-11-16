@@ -168,7 +168,7 @@ function createMockDOM({ withWebCodecs = true } = {}) {
       this._className = "";
       this.classList = new MockClassList(this);
       this.id = "";
-      this.textContent = "";
+      this._textContent = "";
       this._innerHTML = "";
       this.clientWidth = 0;
       this.clientHeight = 0;
@@ -177,6 +177,15 @@ function createMockDOM({ withWebCodecs = true } = {}) {
       this._rect = { left: 0, top: 0, width: 0, height: 0 };
       this.value = "";
       this.checked = false;
+    }
+
+    get textContent() {
+      if (this.children.length === 0) return this._textContent || "";
+      return this.children.map((c) => c.textContent).join(" ");
+    }
+    set textContent(val) {
+      this._textContent = String(val ?? "");
+      this.children = [];
     }
 
     get className() {
@@ -1394,3 +1403,181 @@ test("10. React WindowPortal adopting existing <video> into Popout Window (and w
   plugin.stop();
 });
 
+test("11. Real-world Popout crop recall: channel header noise ('channel • streamer • ’s Screen'), 0x0 initial videoWidth, new stream wrapper & Popout -> Main roundtrip", () => {
+  const mainEnv = createMockDOM({ withWebCodecs: true });
+  // Simulate an Electron `about:blank` popout window that does NOT have its own WebCodecs constructors
+  // while the main realm DOES — verifying main-realm WebCodecs constructors are used without cross-realm errors!
+  const popoutEnv = createMockDOM({ withWebCodecs: false });
+
+  const openPopouts = new Map([["DISCORD_STREAM_POPOUT", popoutEnv.window]]);
+
+  // Wire PopoutWindowStore onto BdApi mock via constructor meta/api
+  const bdStyles = new Map();
+  const bdData = new Map();
+  const customSandbox = {
+    window: mainEnv.window,
+    document: mainEnv.document,
+    HTMLMediaElement: mainEnv.HTMLMediaElement,
+    MutationObserver: mainEnv.window.MutationObserver,
+    MediaStream: mainEnv.MediaStream,
+    AbortController,
+    AbortSignal,
+    requestAnimationFrame: (cb) => setTimeout(() => cb(Date.now()), 16),
+    cancelAnimationFrame: (id) => clearTimeout(id),
+    localStorage: mainEnv.localStorage,
+    setTimeout,
+    clearTimeout,
+    setInterval: (fn, ms) => {
+      const t = setInterval(fn, ms);
+      t.unref?.();
+      return t;
+    },
+    clearInterval,
+    console,
+    ...mainEnv.webCodecsGlobals,
+    module: { exports: {} },
+    exports: {},
+    BdApi: {
+      DOM: {
+        addStyle: (id, css) => bdStyles.set(id, css),
+        removeStyle: (id) => bdStyles.delete(id)
+      },
+      Data: {
+        load: (plugin, key) => bdData.get(`${plugin}:${key}`),
+        save: (plugin, key, val) => bdData.set(`${plugin}:${key}`, val)
+      },
+      UI: {
+        buildSettingsPanel: (spec) => spec,
+        showToast: () => {},
+        createTooltip: () => ({ destroy() {} })
+      },
+      Webpack: {
+        getStore: (name) =>
+          name === "PopoutWindowStore"
+            ? {
+                getWindowKeys: () => [...openPopouts.keys()],
+                getWindow: (k) => openPopouts.get(k)
+              }
+            : null
+      },
+      Logger: { warn: () => {} }
+    }
+  };
+  vm.runInNewContext(SOURCE, customSandbox, { filename: "StreamCropper.plugin.js" });
+  const RealPlugin = customSandbox.module.exports;
+  const plugin = new RealPlugin();
+  plugin.start();
+
+  // 1) Main window: watching a 1280x720 standard 16:9 stream (`streamer-one`) — note: vTrack.getSettings() omits width/height!
+  const mainStage = mainEnv.document.createElement("div");
+  mainStage.clientWidth = 1100;
+  mainStage.clientHeight = 620;
+  const mainBadge = mainEnv.document.createElement("span");
+  mainBadge.textContent = "streamer-one";
+  mainStage.appendChild(mainBadge);
+
+  const mainVideo = mainEnv.document.createElement("video");
+  const mainStream = Object.assign(
+    new mainEnv.MediaStream([{ id: "webrtc-track-orig", kind: "video", getSettings: () => ({}) }]),
+    { id: "webrtc-stream-orig" }
+  );
+  mainVideo.srcObject = mainStream;
+  mainVideo.clientWidth = 1100;
+  mainVideo.clientHeight = 620;
+  mainVideo.videoWidth = 1280;
+  mainVideo.videoHeight = 720;
+  mainStage.appendChild(mainVideo);
+  mainEnv.document.body.appendChild(mainStage);
+
+  plugin.scan();
+
+  // User crops `streamer-one` in Main Window to `left`
+  const mainHud = mainStage.querySelector(".dsc-hud");
+  const leftBtn = mainHud.querySelectorAll("button").find((b) => b.dataset.preset === "left");
+  leftBtn.dispatchEvent(mainEnv.makeEvent("click"));
+  assert.equal(RealPlugin.isCroppedStream(mainVideo.srcObject), true, "Cropped in main window");
+
+  // 2) User clicks Discord's Pop Out button:
+  // - Main `<video>` unmounts (`mainStage.remove()`)
+  // - Popout window renders top titlebar: `<span>voice lobby</span><span>•</span><span>streamer-one</span><span>•</span><span>'s Screen</span><span>720p 60FPS</span><span>LIVE</span>`
+  // - Popout `<video>` mounts with a NEW cloned MediaStream ID, `videoWidth = 0` initially (before first frame decodes), and DIFFERENT `clientWidth` (900x506)!
+  mainStage.remove();
+
+  const popoutShell = popoutEnv.document.createElement("div");
+  popoutShell.clientWidth = 900;
+  popoutShell.clientHeight = 560;
+
+  const headerBar = popoutEnv.document.createElement("div");
+  headerBar.clientWidth = 900;
+  headerBar.clientHeight = 48;
+  for (const token of ["voice lobby", "•", "streamer-one", "•", "'s Screen", "720p 60FPS", "LIVE"]) {
+    const s = popoutEnv.document.createElement("span");
+    s.textContent = token;
+    headerBar.appendChild(s);
+  }
+  popoutShell.appendChild(headerBar);
+
+  const popoutStage = popoutEnv.document.createElement("div");
+  popoutStage.clientWidth = 900;
+  popoutStage.clientHeight = 506;
+  const popoutVideo = popoutEnv.document.createElement("video");
+  const clonedPopoutStream = Object.assign(
+    new mainEnv.MediaStream([{ id: "webrtc-track-cloned", kind: "video", getSettings: () => ({}) }]),
+    { id: "webrtc-stream-cloned" }
+  );
+  popoutVideo.srcObject = clonedPopoutStream;
+  popoutVideo.clientWidth = 900;
+  popoutVideo.clientHeight = 506;
+  popoutVideo.videoWidth = 0; // First frame hasn't decoded yet!
+  popoutVideo.videoHeight = 0;
+
+  popoutStage.appendChild(popoutVideo);
+  popoutShell.appendChild(popoutStage);
+  popoutEnv.document.body.appendChild(popoutShell);
+
+  plugin.scan();
+
+  // Popout MUST extract `"streamer-one"` (right before `'s Screen`, NOT `"voice lobby"`!)
+  // and immediately restore the `left` crop using main-realm WebCodecs!
+  const popoutController = plugin.controllers.get(popoutVideo);
+  assert.ok(popoutController, "Mounted controller on popout video");
+  assert.equal(RealPlugin.isCroppedStream(popoutVideo.srcObject), true, "Popout immediately remembered and applied crop!");
+  assert.equal(popoutController.activePreset, "left", "Popout recalled exact 'left' preset");
+  assert.equal(popoutController.cropSession.mode, "webcodecs", "Used main-realm WebCodecs cleanly inside about:blank popout");
+
+  // 3) User changes crop to `right` INSIDE the Popout window, then closes the Popout back to Main Window!
+  assert.equal(popoutController.host, popoutStage, "Mounted on popout video stage below titlebar (avoiding 720p 60FPS LIVE header overlap)");
+  const popoutHud = popoutStage.querySelector(".dsc-hud");
+  const rightBtn = popoutHud.querySelectorAll("button").find((b) => b.dataset.preset === "right");
+  rightBtn.dispatchEvent(popoutEnv.makeEvent("click"));
+  assert.equal(popoutController.activePreset, "right");
+
+  openPopouts.clear();
+  popoutEnv.window.closed = true;
+
+  const returnedMainStage = mainEnv.document.createElement("div");
+  returnedMainStage.clientWidth = 1100;
+  returnedMainStage.clientHeight = 620;
+  const returnedBadge = mainEnv.document.createElement("span");
+  returnedBadge.textContent = "streamer-one";
+  returnedMainStage.appendChild(returnedBadge);
+  const returnedVideo = mainEnv.document.createElement("video");
+  returnedVideo.srcObject = Object.assign(
+    new mainEnv.MediaStream([{ id: "webrtc-track-return", kind: "video", getSettings: () => ({}) }]),
+    { id: "webrtc-stream-return" }
+  );
+  returnedVideo.clientWidth = 1100;
+  returnedVideo.clientHeight = 620;
+  returnedVideo.videoWidth = 1280;
+  returnedVideo.videoHeight = 720;
+  returnedMainStage.appendChild(returnedVideo);
+  mainEnv.document.body.appendChild(returnedMainStage);
+
+  plugin.scan();
+
+  const returnedController = plugin.controllers.get(returnedVideo);
+  assert.equal(RealPlugin.isCroppedStream(returnedVideo.srcObject), true, "Main window remembered crop changed inside Popout");
+  assert.equal(returnedController.activePreset, "right", "Main window recalled updated 'right' preset from Popout");
+
+  plugin.stop();
+});

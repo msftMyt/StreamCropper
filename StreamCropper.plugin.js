@@ -600,26 +600,82 @@
     return doc?.body || doc?.documentElement || null;
   }
 
-  // Grab the streamer's display name from Discord's overlay badge without relying
-  // on hashed Discord class names that break on client updates.
-  function extractStreamerLabelFromNode(container, excludeRoot = null) {
-    if (!container) return "";
-    for (const el of container.querySelectorAll("span, div")) {
-      if (excludeRoot?.contains(el)) continue;
-      if (el.children.length > 0) continue;
-      const text = el.textContent?.trim() ?? "";
-      if (
-        text.length >= 2 &&
-        text.length <= 32 &&
-        !/^(LIVE|HD|FHD|QHD|4K|1080p|720p|1440p|60|30|FPS|\d+[:x×]\d+)$/i.test(text)
-      ) {
-        return text.toLowerCase();
-      }
-    }
-    return "";
+  const BADGE_NOISE_RE = /^(LIVE|HD|FHD|QHD|4K|1080p|720p|1440p|2160p|60|30|FPS|•|'s\s*screen|’s\s*screen|watch\s*stream|stop\s*watching|pop\s*out|disconnect|mute|unmute|deafen|undeafen|crop|source\s*crop|reset|full|left|center|right|save|\d+[:x×]\d+|\d{1,2}:\d{2}(:\d{2})?|\d+p\s*\d*fps)$/i;
+
+  function isValidStreamerLabel(raw) {
+    const text = String(raw ?? "").trim();
+    return text.length >= 2 && text.length <= 32 && !BADGE_NOISE_RE.test(text);
   }
 
-  function buildStreamIdentities(stream, dims, streamerLabel = "") {
+  // Extract ordered streamer label candidates without relying on hashed Discord classes.
+  // Handles both stage overlay badges (`beh.`) and popout header bars (`channel • beh. • 's Screen`)
+  // where scanning naively from the top would pick the channel name before the streamer name!
+  function extractStreamerLabels(container, doc = null, excludeRoot = null) {
+    const labels = [];
+    const addLabel = (val) => {
+      const clean = String(val ?? "").trim().toLowerCase();
+      if (isValidStreamerLabel(clean) && !labels.includes(clean)) {
+        labels.push(clean);
+      }
+    };
+
+    // 1) High-precision Popout/Header check: look for `<name>` immediately preceding `'s Screen`
+    const searchRoot = doc?.body || container;
+    if (searchRoot?.querySelectorAll) {
+      const leafTexts = [];
+      for (const el of searchRoot.querySelectorAll("span, div, h1, h2, h3")) {
+        if (excludeRoot?.contains(el)) continue;
+        if (el.children.length > 0) continue;
+        const txt = el.textContent?.trim() ?? "";
+        if (txt) leafTexts.push({ el, txt });
+      }
+
+      for (let i = 0; i < leafTexts.length; i++) {
+        const cur = leafTexts[i].txt;
+        const inlineMatch = cur.match(/^(.+?)(?:'s|’s)\s+screen$/i);
+        if (inlineMatch && inlineMatch[1]) {
+          // Strip leading channel bullet if formatted as `channel • user's Screen`
+          const parts = inlineMatch[1].split("•").map((s) => s.trim()).filter(Boolean);
+          if (parts.length) addLabel(parts[parts.length - 1]);
+        } else if (/^(?:'s|’s)\s*screen$/i.test(cur)) {
+          // Walk backward over bullet separators (`•`) to grab the streamer token right before `'s Screen`
+          for (let j = i - 1; j >= 0 && j >= i - 4; j--) {
+            const prev = leafTexts[j].txt;
+            if (prev === "•" || prev === "·" || prev === "-") continue;
+            addLabel(prev);
+            break;
+          }
+        }
+      }
+    }
+
+    // 2) Stage overlay badges inside `container` (preferring badges positioned inside the player stage
+    // rather than top window titlebars, and scanning bottom-up since Discord places the streamer pill
+    // in the bottom-left of the video stage!)
+    if (container?.querySelectorAll) {
+      const stageLeaves = [];
+      for (const el of container.querySelectorAll("span, div")) {
+        if (excludeRoot?.contains(el)) continue;
+        if (el.children.length > 0) continue;
+        const txt = el.textContent?.trim() ?? "";
+        if (isValidStreamerLabel(txt)) {
+          stageLeaves.push(txt);
+        }
+      }
+      for (let i = stageLeaves.length - 1; i >= 0; i--) {
+        addLabel(stageLeaves[i]);
+      }
+    }
+
+    if (doc?.title) {
+      const titleMatch = doc.title.match(/^(.+?)(?:'s|’s)\s+screen/i);
+      if (titleMatch?.[1]) addLabel(titleMatch[1]);
+    }
+
+    return labels;
+  }
+
+  function buildStreamIdentities(stream, intrinsicDims, streamerLabels = []) {
     const sessionKeys = [];
     const persistentKeys = [];
 
@@ -629,17 +685,34 @@
       if (vTrack?.id) sessionKeys.push(`track:${vTrack.id}`);
     }
 
-    const width = Number(dims?.width) || 0;
-    const height = Number(dims?.height) || 0;
+    const width = Number(intrinsicDims?.width) || 0;
+    const height = Number(intrinsicDims?.height) || 0;
     const hasDims = width > 0 && height > 0;
 
-    if (streamerLabel && hasDims) persistentKeys.push(`streamer:${streamerLabel}|${width}x${height}`);
-    if (streamerLabel) persistentKeys.push(`streamer:${streamerLabel}`);
+    const labelList = Array.isArray(streamerLabels)
+      ? streamerLabels
+      : streamerLabels
+        ? [streamerLabels]
+        : [];
+
+    for (const rawLabel of labelList) {
+      const label = String(rawLabel ?? "").trim().toLowerCase();
+      if (!label) continue;
+      if (hasDims) persistentKeys.push(`streamer:${label}|${width}x${height}`);
+      persistentKeys.push(`streamer:${label}`);
+    }
+
     if (hasDims && width / Math.max(1, height) > 2.05) {
       persistentKeys.push(`ultrawide-res:${width}x${height}`);
     }
 
-    return { sessionKeys, persistentKeys };
+    return {
+      sessionKeys,
+      persistentKeys,
+      width,
+      height,
+      primaryStreamer: labelList[0] ?? ""
+    };
   }
 
   function resolvePlayerHostForVideo(video, doc) {
@@ -660,18 +733,25 @@
       if (cur.querySelectorAll("video").length > 1) break;
 
       if (cur !== immediate && cur.children.length > 1) {
-        let hasParticipantRow = false;
+        let hasChromeOrParticipantSibling = false;
         for (const child of cur.children) {
           if (child.contains(video)) continue;
           const cr = child.getBoundingClientRect();
           const cw = child.clientWidth || cr.width;
           const ch = child.clientHeight || cr.height;
+          // Stop before climbing into outer shells holding either the bottom participant
+          // tile strip (ch >= 95) OR a full-width top window/popout header bar (ch 22..94)
+          // when the sibling sits outside the video box!
           if (cw > 300 && ch >= 95) {
-            hasParticipantRow = true;
+            hasChromeOrParticipantSibling = true;
+            break;
+          }
+          if (cw > 300 && ch >= 20 && ch < 95 && child.textContent?.includes("Screen")) {
+            hasChromeOrParticipantSibling = true;
             break;
           }
         }
-        if (hasParticipantRow) break;
+        if (hasChromeOrParticipantSibling) break;
       }
 
       const rect = cur.getBoundingClientRect();
@@ -797,9 +877,13 @@
     }
 
     static supportsWebCodecs(win = null) {
-      const ProcessorCtor = win?.["MediaStreamTrackProcessor"] ?? (typeof MediaStreamTrackProcessor === "function" ? MediaStreamTrackProcessor : null);
-      const GeneratorCtor = win?.["MediaStreamTrackGenerator"] ?? (typeof MediaStreamTrackGenerator === "function" ? MediaStreamTrackGenerator : null);
-      const FrameCtor = win?.["VideoFrame"] ?? (typeof VideoFrame === "function" ? VideoFrame : null);
+      // Prefer the main BetterDiscord realm's WebCodecs constructors first:
+      // Discord creates all WebRTC MediaStreamTracks in the main window's peer connection,
+      // so constructing Processor/Generator/MediaStream in the main realm avoids cross-realm
+      // track/stream TypeErrors inside `about:blank` popout windows!
+      const ProcessorCtor = (typeof MediaStreamTrackProcessor === "function" ? MediaStreamTrackProcessor : null) ?? win?.["MediaStreamTrackProcessor"];
+      const GeneratorCtor = (typeof MediaStreamTrackGenerator === "function" ? MediaStreamTrackGenerator : null) ?? win?.["MediaStreamTrackGenerator"];
+      const FrameCtor = (typeof VideoFrame === "function" ? VideoFrame : null) ?? win?.["VideoFrame"];
       return (
         typeof ProcessorCtor === "function" &&
         typeof GeneratorCtor === "function" &&
@@ -830,11 +914,32 @@
     }
 
     startWebCodecs(videoTrack, audioTracks) {
-      const ProcessorCtor = this.win?.["MediaStreamTrackProcessor"] ?? MediaStreamTrackProcessor;
-      const GeneratorCtor = this.win?.["MediaStreamTrackGenerator"] ?? MediaStreamTrackGenerator;
-      const FrameCtor = this.win?.["VideoFrame"] ?? VideoFrame;
-      const StreamCtor = this.win?.["MediaStream"] ?? MediaStream;
-      const TransformCtor = this.win?.["TransformStream"] ?? TransformStream;
+      // Match the constructor realm of `this.sourceStream` when it belongs to `this.win`
+      // (and `this.win` provides full WebCodecs), otherwise use the main plugin realm!
+      const useWinRealm =
+        this.win &&
+        this.win !== window &&
+        this.win["MediaStream"] &&
+        this.sourceStream instanceof this.win["MediaStream"] &&
+        typeof this.win["MediaStreamTrackProcessor"] === "function" &&
+        typeof this.win["MediaStreamTrackGenerator"] === "function" &&
+        typeof this.win["VideoFrame"] === "function";
+
+      const ProcessorCtor = useWinRealm
+        ? this.win["MediaStreamTrackProcessor"]
+        : (typeof MediaStreamTrackProcessor === "function" ? MediaStreamTrackProcessor : this.win?.["MediaStreamTrackProcessor"]);
+      const GeneratorCtor = useWinRealm
+        ? this.win["MediaStreamTrackGenerator"]
+        : (typeof MediaStreamTrackGenerator === "function" ? MediaStreamTrackGenerator : this.win?.["MediaStreamTrackGenerator"]);
+      const FrameCtor = useWinRealm
+        ? this.win["VideoFrame"]
+        : (typeof VideoFrame === "function" ? VideoFrame : this.win?.["VideoFrame"]);
+      const StreamCtor = useWinRealm
+        ? this.win["MediaStream"]
+        : (typeof MediaStream === "function" ? MediaStream : this.win?.["MediaStream"]);
+      const TransformCtor = useWinRealm
+        ? (this.win["TransformStream"] ?? TransformStream)
+        : (typeof TransformStream === "function" ? TransformStream : this.win?.["TransformStream"]);
 
       const processor = new ProcessorCtor({ track: videoTrack });
       const generator = new GeneratorCtor({ kind: "video" });
@@ -989,6 +1094,7 @@
   class CropStore {
     #dataApi;
     #sessionMemory = new Map();
+    #recentHandoff = null; // Captures active crop across Main <-> Popout window transitions
 
     constructor(dataApi) {
       this.#dataApi = dataApi;
@@ -1080,8 +1186,27 @@
       return this.presets;
     }
 
+    recordHandoff(identities, region, preset = "custom") {
+      if (!this.settings.rememberPerStreamer) return;
+      if (isFullRegion(region)) {
+        this.#recentHandoff = null;
+        return;
+      }
+      this.#recentHandoff = {
+        region: normalizeRegion(region),
+        preset,
+        width: identities?.width || 0,
+        height: identities?.height || 0,
+        streamer: identities?.primaryStreamer || "",
+        sessionKeys: [...(identities?.sessionKeys ?? [])],
+        updatedAt: Date.now()
+      };
+    }
+
     rememberStream(identities, region, preset = "custom") {
       if (!this.settings.rememberPerStreamer || !identities) return;
+
+      this.recordHandoff(identities, region, preset);
 
       const isFull = isFullRegion(region);
       const record = isFull
@@ -1114,7 +1239,7 @@
       if (dirty) this.save();
     }
 
-    recallStream(identities) {
+    recallStream(identities, { allowRecentHandoff = false } = {}) {
       if (!this.settings.rememberPerStreamer || !identities) return null;
 
       for (const sessionKey of identities.sessionKeys) {
@@ -1128,11 +1253,37 @@
         }
       }
 
+      // Window transition handoff (Main <-> Popout): when Discord opens or closes a Popout,
+      // it unmounts the old `<video>` and mounts a new `<video>` (often with a fresh cloned
+      // MediaStream ID and before overlay badges finish rendering). Match recent handoff!
+      if (allowRecentHandoff && this.#recentHandoff) {
+        const ageMs = Date.now() - this.#recentHandoff.updatedAt;
+        if (ageMs <= 10000) {
+          const sameStreamer =
+            this.#recentHandoff.streamer &&
+            identities.primaryStreamer &&
+            this.#recentHandoff.streamer === identities.primaryStreamer;
+          const conflictingStreamer =
+            this.#recentHandoff.streamer &&
+            identities.primaryStreamer &&
+            this.#recentHandoff.streamer !== identities.primaryStreamer;
+          const sameDims =
+            !this.#recentHandoff.width ||
+            !identities.width ||
+            (this.#recentHandoff.width === identities.width && this.#recentHandoff.height === identities.height);
+
+          if (!conflictingStreamer && (sameStreamer || sameDims)) {
+            return this.#recentHandoff;
+          }
+        }
+      }
+
       return null;
     }
 
     clearSession() {
       this.#sessionMemory.clear();
+      this.#recentHandoff = null;
     }
   }
 
@@ -1487,12 +1638,33 @@
       return null;
     }
 
-    rememberStreamCrop(identities, region, preset) {
+    rememberStreamCrop(identities, region, preset, sourceController = null) {
       this.store.rememberStream(identities, region, preset);
+      // Synchronize any other mounted controller showing the same stream (e.g. Main + Popout)
+      const sessionSet = new Set(identities?.sessionKeys ?? []);
+      const primary = identities?.primaryStreamer;
+      for (const other of this.controllers.values()) {
+        if (!other || other === sourceController) continue;
+        const otherId = other.getStreamIdentities();
+        const matchesSession = otherId.sessionKeys.some((k) => sessionSet.has(k));
+        const matchesStreamer = primary && otherId.primaryStreamer && primary === otherId.primaryStreamer;
+        if (matchesSession || matchesStreamer) {
+          if (isFullRegion(region)) {
+            other.reset(false);
+          } else {
+            other.activePreset = preset || "custom";
+            other.setRegion(region, false);
+          }
+        }
+      }
     }
 
-    recallStreamCrop(identities) {
-      return this.store.recallStream(identities);
+    recallStreamCrop(identities, options) {
+      return this.store.recallStream(identities, options);
+    }
+
+    recordStreamHandoff(identities, region, preset) {
+      this.store.recordHandoff(identities, region, preset);
     }
 
     savePreset(name, region) {
@@ -1527,9 +1699,9 @@
       const width = settings?.width || video?.videoWidth || 0;
       const height = settings?.height || video?.videoHeight || 0;
       const host = resolvePlayerHostForVideo(video, doc);
-      const streamer = extractStreamerLabelFromNode(host);
+      const streamers = extractStreamerLabels(host, doc !== document ? doc : null);
       return {
-        identities: buildStreamIdentities(stream, { width, height }, streamer),
+        identities: buildStreamIdentities(stream, { width, height }, streamers),
         width,
         height
       };
@@ -2637,6 +2809,8 @@
       this.doc.addEventListener("webkitfullscreenchange", onFullscreenChange, { signal });
       this.win?.addEventListener?.("resize", onFullscreenChange, { passive: true, signal });
       this.video.addEventListener("loadedmetadata", () => this.handleStreamMetadata(), { signal });
+      this.video.addEventListener("loadeddata", () => this.handleStreamMetadata(), { signal });
+      this.video.addEventListener("playing", () => this.handleStreamMetadata(), { signal });
       this.video.addEventListener("resize", () => this.handleStreamMetadata(), { signal });
 
       this.handleStreamMetadata();
@@ -2711,7 +2885,9 @@
         this.sourceMonitorVideo.srcObject = incomingStream;
       }
 
-      const recalled = this.manager.recallStreamCrop(this.getStreamIdentities());
+      const recalled = this.manager.recallStreamCrop(this.getStreamIdentities(), {
+        allowRecentHandoff: true
+      });
       if (recalled && !isFullRegion(recalled.region)) {
         this.region = normalizeRegion(recalled.region);
         this.activePreset = recalled.preset || "custom";
@@ -2756,6 +2932,13 @@
       const current = this.getNativeSrcObject();
       if (current && !CROPPED_STREAMS.has(current) && current !== this.originalStream) {
         this.adoptIncomingStream(current, null);
+        return;
+      }
+
+      // Retry auto-recall on subsequent scans/mutations if the streamer badge or
+      // video dimensions arrived asynchronously after initial Popout `<video>` mount!
+      if (!this.#didAutoCrop && isFullRegion(this.region)) {
+        this.handleStreamMetadata();
       }
     }
 
@@ -2779,6 +2962,12 @@
     }
 
     destroy() {
+      // Snapshot active crop before unmounting so Main <-> Popout window transitions
+      // hand off the crop seamlessly even when Discord creates a new MediaStream wrapper!
+      if (!isFullRegion(this.region)) {
+        this.manager.recordStreamHandoff(this.getStreamIdentities(), this.region, this.activePreset);
+      }
+
       this.#offRemoved?.();
       this.#offRemoved = null;
 
@@ -2805,20 +2994,51 @@
       }
     }
 
-    extractStreamerLabel() {
-      return extractStreamerLabelFromNode(this.host, this.overlay.rootEl);
+    extractStreamerLabels() {
+      return extractStreamerLabels(
+        this.host,
+        this.doc !== document ? this.doc : null,
+        this.overlay.rootEl
+      );
+    }
+
+    getIntrinsicStreamDimensions() {
+      if (this.sourceMonitorVideo?.videoWidth > 0 && this.sourceMonitorVideo?.videoHeight > 0) {
+        return {
+          width: this.sourceMonitorVideo.videoWidth,
+          height: this.sourceMonitorVideo.videoHeight
+        };
+      }
+
+      const [vTrack] = this.originalStream?.getVideoTracks?.() ?? [];
+      const settings = vTrack?.getSettings?.();
+      if (settings?.width > 0 && settings?.height > 0) {
+        return { width: settings.width, height: settings.height };
+      }
+
+      if (isFullRegion(this.region) && this.video.videoWidth > 0 && this.video.videoHeight > 0) {
+        return { width: this.video.videoWidth, height: this.video.videoHeight };
+      }
+
+      return { width: 0, height: 0 };
     }
 
     getStreamIdentities() {
-      return buildStreamIdentities(this.originalStream, this.getOriginalDimensions(), this.extractStreamerLabel());
+      return buildStreamIdentities(
+        this.originalStream,
+        this.getIntrinsicStreamDimensions(),
+        this.extractStreamerLabels()
+      );
     }
 
     handleStreamMetadata() {
-      const dims = this.getOriginalDimensions();
-      const aspect = dims.width / Math.max(1, dims.height);
+      const intrinsic = this.getIntrinsicStreamDimensions();
+      const aspect = intrinsic.width / Math.max(1, intrinsic.height);
 
       if (!this.#didAutoCrop && isFullRegion(this.region)) {
-        const recalled = this.manager.recallStreamCrop(this.getStreamIdentities());
+        const recalled = this.manager.recallStreamCrop(this.getStreamIdentities(), {
+          allowRecentHandoff: true
+        });
         if (recalled && !isFullRegion(recalled.region)) {
           this.#didAutoCrop = true;
           this.region = normalizeRegion(recalled.region);
@@ -2833,7 +3053,7 @@
         !this.#didAutoCrop &&
         this.manager.settings.autoCenterUltrawide &&
         isFullRegion(this.region) &&
-        dims.width > 0 &&
+        intrinsic.width > 0 &&
         aspect > 2.15
       ) {
         this.#didAutoCrop = true;
@@ -2987,7 +3207,7 @@
       }
       this.applySourceCrop();
       if (persist) {
-        this.manager.rememberStreamCrop(this.getStreamIdentities(), this.region, this.activePreset);
+        this.manager.rememberStreamCrop(this.getStreamIdentities(), this.region, this.activePreset, this);
       }
       this.syncUI();
     }
@@ -3007,7 +3227,7 @@
       );
       this.applySourceCrop();
       if (persist) {
-        this.manager.rememberStreamCrop(this.getStreamIdentities(), this.region, this.activePreset);
+        this.manager.rememberStreamCrop(this.getStreamIdentities(), this.region, this.activePreset, this);
       }
       this.syncUI();
     }
@@ -3019,7 +3239,7 @@
       this.#didAutoCrop = true;
       this.teardownCropSession(true);
       if (persist) {
-        this.manager.rememberStreamCrop(this.getStreamIdentities(), this.region, "full");
+        this.manager.rememberStreamCrop(this.getStreamIdentities(), this.region, "full", this);
       }
       this.syncUI();
     }
