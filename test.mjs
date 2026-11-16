@@ -114,8 +114,9 @@ function createMockDOM({ withWebCodecs = true } = {}) {
     }
   }
 
-  class MockMediaStream {
+  class MockMediaStream extends MockEventTarget {
     constructor(tracks = []) {
+      super();
       this._tracks = [...tracks];
     }
     getVideoTracks() {
@@ -125,7 +126,11 @@ function createMockDOM({ withWebCodecs = true } = {}) {
       return this._tracks.filter((t) => t.kind === "audio");
     }
     addTrack(track) {
-      this._tracks.push(track);
+      if (!this._tracks.includes(track)) this._tracks.push(track);
+    }
+    removeTrack(track) {
+      const idx = this._tracks.indexOf(track);
+      if (idx >= 0) this._tracks.splice(idx, 1);
     }
   }
 
@@ -292,12 +297,29 @@ function createMockDOM({ withWebCodecs = true } = {}) {
     querySelector(selector) {
       return this.querySelectorAll(selector)[0] || null;
     }
+    closest(selector) {
+      let cur = this;
+      while (cur) {
+        if (matchesSelector(cur, selector)) return cur;
+        cur = cur.parentElement;
+      }
+      return null;
+    }
+  }
+
+  function matchesSingleSelector(el, single) {
+    const s = single.trim();
+    if (!s) return false;
+    if (s.startsWith("#")) return el.id === s.slice(1);
+    if (s.startsWith(".")) return el.classList.contains(s.slice(1));
+    return el.tagName === s.toUpperCase();
   }
 
   function matchesSelector(el, selector) {
-    if (selector.startsWith("#")) return el.id === selector.slice(1);
-    if (selector.startsWith(".")) return el.classList.contains(selector.slice(1));
-    return el.tagName === selector.toUpperCase();
+    if (selector.includes(",")) {
+      return selector.split(",").some((part) => matchesSingleSelector(el, part));
+    }
+    return matchesSingleSelector(el, selector);
   }
 
   class MockDocument extends MockEventTarget {
@@ -1578,6 +1600,252 @@ test("11. Real-world Popout crop recall: channel header noise ('channel • stre
   const returnedController = plugin.controllers.get(returnedVideo);
   assert.equal(RealPlugin.isCroppedStream(returnedVideo.srcObject), true, "Main window remembered crop changed inside Popout");
   assert.equal(returnedController.activePreset, "right", "Main window recalled updated 'right' preset from Popout");
+
+  plugin.stop();
+});
+
+test("12. Crop removal (Reset) persistence, legacy ultrawide-res purge, autoCenterUltrawide override, multi-streamer isolation, delayed audio addtrack & zero-thrash drag", async () => {
+  const { env, PluginClass, bdData } = loadPlugin({ asBetterDiscord: true, withWebCodecs: true });
+
+  // Pre-seed legacy `ultrawide-res:2560x720` entry in config (mirroring real-world upgraded configs!)
+  bdData.set("StreamCropper:config", {
+    settings: {
+      buttonPosition: "top-right",
+      rememberPerStreamer: true,
+      autoCenterUltrawide: false,
+      defaultSliceAspect: "16:9",
+      showResolutionBadge: true
+    },
+    presets: [],
+    rememberedCrops: [
+      {
+        key: "ultrawide-res:2560x720",
+        region: { x: 0.25, y: 0, w: 0.5, h: 1 },
+        preset: "center",
+        updatedAt: Date.now() - 5000
+      }
+    ]
+  });
+
+  const plugin = new PluginClass();
+  plugin.start();
+
+  // 1) Mount streamer `alpha-uw` at 2560x720 where `vTrack.getSettings()` omits width/height
+  const stageA = env.document.createElement("div");
+  stageA.clientWidth = 1280;
+  stageA.clientHeight = 720;
+  const badgeA = env.document.createElement("span");
+  badgeA.textContent = "alpha-uw";
+  stageA.appendChild(badgeA);
+
+  let trackA = null;
+  const streamA = Object.assign(
+    new env.MediaStream([
+      {
+        id: "alpha-track-1",
+        kind: "video",
+        getSettings: () => ({})
+      }
+    ]),
+    { id: "alpha-stream-1" }
+  );
+  [trackA] = streamA.getVideoTracks();
+
+  const videoA = env.document.createElement("video");
+  videoA.srcObject = streamA;
+  videoA.clientWidth = 1280;
+  videoA.clientHeight = 720;
+  videoA.videoWidth = 2560;
+  videoA.videoHeight = 720;
+  stageA.appendChild(videoA);
+  env.document.body.appendChild(stageA);
+
+  plugin.scan();
+  assert.equal(PluginClass.isCroppedStream(videoA.srcObject), true, "Recalled pre-seeded legacy ultrawide-res:2560x720 crop");
+
+  // Push a real 2560x720 frame through WebCodecs and simulate Chromium shrinking `video.videoWidth` to 1280 (cropped!)
+  trackA._pushFrame(2560, 720, 1000);
+  await new Promise((r) => setTimeout(r, 25));
+  videoA.videoWidth = 1280; // Cropped output width!
+  videoA.videoHeight = 720;
+
+  // Also test Bug 14: Discord negotiates and adds screen-share audio track AFTER stream is already cropped!
+  const lateAudioTrack = { id: "late-audio-1", kind: "audio" };
+  streamA.addTrack(lateAudioTrack);
+  streamA.dispatchEvent(env.makeEvent("addtrack", { track: lateAudioTrack }));
+  assert.equal(videoA.srcObject.getAudioTracks().length, 1, "Delayed WebRTC audio track synced onto active cropped stream!");
+
+  // 2) User clicks Reset while `videoA.videoWidth` is STILL 1280 (cropped) and HUD is closed (`sourceMonitorVideo === null`)!
+  const resetBtn = stageA.querySelector(".dsc-reset-btn");
+  resetBtn.dispatchEvent(env.makeEvent("click"));
+  assert.equal(videoA.srcObject, streamA, "Restored original stream immediately");
+
+  // Verify legacy `ultrawide-res:2560x720` was PURGED from saved config and `streamer:alpha-uw` has `isReset: true`!
+  const savedAfterReset = bdData.get("StreamCropper:config");
+  assert.equal(
+    savedAfterReset.rememberedCrops.some((c) => c.key === "ultrawide-res:2560x720"),
+    false,
+    "Purged stale legacy ultrawide-res:2560x720 entry on Reset"
+  );
+  const alphaResetEntry = savedAfterReset.rememberedCrops.find((c) => c.key === "streamer:alpha-uw");
+  assert.ok(alphaResetEntry?.isReset, "Saved explicit isReset tombstone for streamer:alpha-uw");
+
+  // 3) Unmount `alpha-uw` and remount with a brand-new stream/track ID -> MUST stay uncropped (Reset remembered)!
+  stageA.remove();
+  plugin.scan();
+
+  const stageA2 = env.document.createElement("div");
+  stageA2.clientWidth = 1280;
+  stageA2.clientHeight = 720;
+  const badgeA2 = env.document.createElement("span");
+  badgeA2.textContent = "alpha-uw";
+  stageA2.appendChild(badgeA2);
+  const videoA2 = env.document.createElement("video");
+  const streamA2 = Object.assign(new env.MediaStream([{ id: "alpha-track-2", kind: "video", getSettings: () => ({ width: 2560, height: 720 }) }]), {
+    id: "alpha-stream-2"
+  });
+  videoA2.srcObject = streamA2;
+  videoA2.clientWidth = 1280;
+  videoA2.clientHeight = 720;
+  videoA2.videoWidth = 2560;
+  videoA2.videoHeight = 720;
+  stageA2.appendChild(videoA2);
+  env.document.body.appendChild(stageA2);
+
+  plugin.scan();
+  assert.equal(videoA2.srcObject, streamA2, "Crop removal (Reset) remembered when returning to alpha-uw!");
+  assert.equal(plugin.controllers.get(videoA2).activePreset, "full");
+
+  // 4) Enable `autoCenterUltrawide = true`:
+  // - `alpha-uw` (explicitly Reset earlier) MUST stay uncropped even when its badge renders 50ms AFTER `videoWidth`!
+  // - `bravo-uw` (brand-new ultrawide streamer) MUST auto-center WITHOUT polluting `config.json`!
+  stageA2.remove();
+  plugin.scan();
+  plugin.store.updateSetting("autoCenterUltrawide", true);
+
+  const stageLateBadge = env.document.createElement("div");
+  stageLateBadge.clientWidth = 1280;
+  stageLateBadge.clientHeight = 720;
+  const videoLate = env.document.createElement("video");
+  const streamLate = Object.assign(new env.MediaStream([{ id: "alpha-track-3", kind: "video", getSettings: () => ({ width: 5120, height: 1440 }) }]), {
+    id: "alpha-stream-3"
+  });
+  videoLate.srcObject = streamLate;
+  videoLate.clientWidth = 1280;
+  videoLate.clientHeight = 720;
+  videoLate.videoWidth = 5120;
+  videoLate.videoHeight = 1440;
+  stageLateBadge.appendChild(videoLate);
+  env.document.body.appendChild(stageLateBadge);
+
+  plugin.scan(); // Tentatively auto-centers before badge arrives
+  assert.equal(PluginClass.isCroppedStream(videoLate.srcObject), true, "Tentatively auto-centered before streamer badge mounted");
+
+  // Now Discord mounts the `alpha-uw` badge! Next scan/mutation recalls `alpha-uw`'s explicit Reset and un-crops!
+  const lateSpan = env.document.createElement("span");
+  lateSpan.textContent = "alpha-uw";
+  stageLateBadge.appendChild(lateSpan);
+  plugin.scan();
+  assert.equal(videoLate.srcObject, streamLate, "Late-arriving streamer badge recalled explicit Reset and overrode autoCenterUltrawide!");
+
+  // Mount brand-new `bravo-uw`: auto-centers, but does NOT write fake manual crop to disk!
+  stageLateBadge.remove();
+  plugin.scan();
+
+  const stageBravo = env.document.createElement("div");
+  stageBravo.clientWidth = 1280;
+  stageBravo.clientHeight = 720;
+  const badgeBravo = env.document.createElement("span");
+  badgeBravo.textContent = "bravo-uw";
+  stageBravo.appendChild(badgeBravo);
+  const videoBravo = env.document.createElement("video");
+  videoBravo.srcObject = Object.assign(new env.MediaStream([{ id: "bravo-track-1", kind: "video", getSettings: () => ({ width: 5120, height: 1440 }) }]), {
+    id: "bravo-stream-1"
+  });
+  videoBravo.clientWidth = 1280;
+  videoBravo.clientHeight = 720;
+  videoBravo.videoWidth = 5120;
+  videoBravo.videoHeight = 1440;
+  stageBravo.appendChild(videoBravo);
+  env.document.body.appendChild(stageBravo);
+
+  plugin.scan();
+  assert.equal(PluginClass.isCroppedStream(videoBravo.srcObject), true, "New ultrawide streamer bravo-uw auto-centered");
+  assert.equal(
+    bdData.get("StreamCropper:config").rememberedCrops.some((c) => c.key.includes("bravo-uw")),
+    false,
+    "autoCenterUltrawide did NOT write fake manual crop entry to persistent disk storage"
+  );
+
+  // 5) Multi-streamer isolation: manually crop `bravo-uw` to `left`, verify `alpha-uw` STILL remembers its `Reset`,
+  // and resetting `alpha-uw` does NOT wipe `bravo-uw`'s `left` crop!
+  plugin.store.updateSetting("autoCenterUltrawide", false);
+  const bravoHud = stageBravo.querySelector(".dsc-hud");
+  bravoHud.querySelectorAll("button").find((b) => b.dataset.preset === "left").dispatchEvent(env.makeEvent("click"));
+
+  // Also test Bug 11: Minimap drag `mousemove` causes ZERO synchronous disk writes until `mouseup`!
+  const bravoTrigger = stageBravo.querySelector(".dsc-trigger");
+  bravoTrigger.dispatchEvent(env.makeEvent("click"));
+  const minimap = stageBravo.querySelector(".dsc-minimap");
+  minimap._rect = { left: 0, top: 0, width: 312, height: 90 };
+  const minimapBox = stageBravo.querySelector(".dsc-minimap-box");
+
+  let saveCount = 0;
+  const origSave = plugin.api.Data.save;
+  plugin.api.Data.save = (k, v) => {
+    saveCount++;
+    return origSave(k, v);
+  };
+
+  minimap.dispatchEvent(env.makeEvent("mousedown", { button: 0, clientX: 40, clientY: 45, target: minimapBox }));
+  env.window.dispatchEvent(env.makeEvent("mousemove", { clientX: 60, clientY: 45 }));
+  env.window.dispatchEvent(env.makeEvent("mousemove", { clientX: 80, clientY: 45 }));
+  env.window.dispatchEvent(env.makeEvent("mousemove", { clientX: 100, clientY: 45 }));
+  assert.equal(saveCount, 0, "Zero synchronous BdApi.Data.save disk writes during minimap mousemove!");
+  env.window.dispatchEvent(env.makeEvent("mouseup", { clientX: 100, clientY: 45 }));
+  assert.equal(saveCount, 1, "Persisted once cleanly on mouseup!");
+
+  // Switch back to `alpha-uw` -> still uncropped! Switch back to `bravo-uw` -> still cropped!
+  stageBravo.remove();
+  plugin.scan();
+
+  const stageAlphaCheck = env.document.createElement("div");
+  stageAlphaCheck.clientWidth = 1280;
+  stageAlphaCheck.clientHeight = 720;
+  const spanAlphaCheck = env.document.createElement("span");
+  spanAlphaCheck.textContent = "alpha-uw";
+  stageAlphaCheck.appendChild(spanAlphaCheck);
+  const vidAlphaCheck = env.document.createElement("video");
+  const rawAlphaCheck = new env.MediaStream([{ id: "alpha-track-4", kind: "video", getSettings: () => ({ width: 5120, height: 1440 }) }]);
+  vidAlphaCheck.srcObject = rawAlphaCheck;
+  vidAlphaCheck.clientWidth = 1280;
+  vidAlphaCheck.clientHeight = 720;
+  vidAlphaCheck.videoWidth = 5120;
+  vidAlphaCheck.videoHeight = 1440;
+  stageAlphaCheck.appendChild(vidAlphaCheck);
+  env.document.body.appendChild(stageAlphaCheck);
+
+  plugin.scan();
+  assert.equal(vidAlphaCheck.srcObject, rawAlphaCheck, "bravo-uw's crop did NOT override alpha-uw's Reset tombstone!");
+
+  stageAlphaCheck.remove();
+  const stageBravoCheck = env.document.createElement("div");
+  stageBravoCheck.clientWidth = 1280;
+  stageBravoCheck.clientHeight = 720;
+  const spanBravoCheck = env.document.createElement("span");
+  spanBravoCheck.textContent = "bravo-uw";
+  stageBravoCheck.appendChild(spanBravoCheck);
+  const vidBravoCheck = env.document.createElement("video");
+  vidBravoCheck.srcObject = new env.MediaStream([{ id: "bravo-track-2", kind: "video", getSettings: () => ({ width: 5120, height: 1440 }) }]);
+  vidBravoCheck.clientWidth = 1280;
+  vidBravoCheck.clientHeight = 720;
+  vidBravoCheck.videoWidth = 5120;
+  vidBravoCheck.videoHeight = 1440;
+  stageBravoCheck.appendChild(vidBravoCheck);
+  env.document.body.appendChild(stageBravoCheck);
+
+  plugin.scan();
+  assert.equal(PluginClass.isCroppedStream(vidBravoCheck.srcObject), true, "bravo-uw retained its custom crop independently!");
 
   plugin.stop();
 });
