@@ -1333,3 +1333,58 @@ test("9. Discord In-App Floating Mini-Player (PiP) & OS Picture-in-Picture crop 
 
   plugin.stop();
 });
+
+test("10. React WindowPortal adopting existing <video> into Popout Window (and wiping popout <head>): never renders unstyled overlay", () => {
+  const mainEnv = createMockDOM({ withWebCodecs: true });
+  const popoutEnv = createMockDOM({ withWebCodecs: true });
+
+  // Simulate PopoutWindowStore NOT returning the window (or returning empty keys) AND Discord
+  // adopting the existing main-window `<video>` directly into `popoutEnv.document`!
+  const { PluginClass } = loadPlugin({ asBetterDiscord: true, withWebCodecs: true, existingEnv: mainEnv });
+  const plugin = new PluginClass();
+  plugin.start();
+
+  const mainStage = mainEnv.document.createElement("div");
+  mainStage.clientWidth = 1280;
+  mainStage.clientHeight = 720;
+
+  const stream = Object.assign(
+    new mainEnv.MediaStream([{ id: "adopt-track-1", kind: "video", getSettings: () => ({ width: 1280, height: 720 }) }]),
+    { id: "adopt-stream-1" }
+  );
+  const video = mainEnv.document.createElement("video");
+  video.srcObject = stream;
+  video.clientWidth = 1280;
+  video.clientHeight = 720;
+  mainStage.appendChild(video);
+  mainEnv.document.body.appendChild(mainStage);
+
+  plugin.scan();
+  assert.ok(mainStage.querySelector(".dsc-root"), "Mounted in main window initially");
+
+  // Discord pops out the stream by moving the SAME `<video>` node into `popoutEnv.document`!
+  const popoutStage = popoutEnv.document.createElement("div");
+  popoutStage.clientWidth = 1280;
+  popoutStage.clientHeight = 720;
+  popoutEnv.document.body.appendChild(popoutStage);
+
+  video._ownerDoc = popoutEnv.document;
+  popoutStage.appendChild(video);
+
+  plugin.scan();
+
+  // 1) Old main-document controller was replaced by a popout-document controller
+  const popoutRoot = popoutStage.querySelector(".dsc-root");
+  assert.ok(popoutRoot, "Fresh overlay mounted inside popout stage");
+  assert.equal(popoutRoot.ownerDocument, popoutEnv.document, "Overlay elements belong to popout document");
+  assert.ok(popoutEnv.document.getElementById("dsc-stream-cropper-styles"), "Stylesheet injected into popout <head>");
+  assert.ok(popoutRoot.querySelector("style"), "Local fallback <style> embedded inside popout .dsc-root");
+
+  // 2) Even if Discord's WindowPortal wipes `popoutEnv.document.head.innerHTML = ""`, styles are re-injected on scan AND embedded locally!
+  popoutEnv.document.head.innerHTML = "";
+  plugin.scan();
+  assert.ok(popoutEnv.document.getElementById("dsc-stream-cropper-styles"), "Re-injected <head> stylesheet after WindowPortal wipe");
+
+  plugin.stop();
+});
+

@@ -1181,7 +1181,10 @@
 
       try {
         const webpackApi = this.api.Webpack ?? (typeof BdApi !== "undefined" ? BdApi.Webpack : null);
-        this.#popoutStore = webpackApi?.getStore?.("PopoutWindowStore") ?? null;
+        this.#popoutStore =
+          webpackApi?.getStore?.("PopoutWindowStore") ??
+          webpackApi?.getByKeys?.("getWindow", "getWindowKeys") ??
+          null;
       } catch (err) {
         logWarn("Failed to resolve PopoutWindowStore; popout window discovery restricted to iframes.", err);
         this.#popoutStore = null;
@@ -1279,37 +1282,54 @@
       return docs;
     }
 
+    ensureSecondaryDocumentStyles(doc) {
+      if (!doc || doc === document) return null;
+      let styleEl = doc.getElementById?.(STYLE_ID) ?? null;
+      if (styleEl) return styleEl;
+
+      const styleTarget = doc.head || doc.documentElement;
+      if (!styleTarget) return null;
+
+      styleEl = doc.createElement("style");
+      styleEl.id = STYLE_ID;
+      styleEl.textContent = STYLES;
+      styleTarget.appendChild(styleEl);
+      return styleEl;
+    }
+
     ensureSecondaryDocumentTracked(doc) {
-      if (!doc || doc === document || this.#trackedDocs.has(doc)) return;
+      if (!doc || doc === document) return;
       const win = doc.defaultView;
       if (win?.closed) return;
 
+      const existing = this.#trackedDocs.get(doc);
+      if (existing) {
+        // Discord's WindowPortal clears or clones `<head>` stylesheets asynchronously
+        // after `window.open`; re-verify our `<style>` is still connected every scan!
+        if (!existing.styleEl?.isConnected) {
+          existing.styleEl = this.ensureSecondaryDocumentStyles(doc);
+        }
+        return;
+      }
+
       const abort = new AbortController();
       const { signal } = abort;
-
-      let styleEl = doc.getElementById?.(STYLE_ID) ?? null;
-      if (!styleEl) {
-        const styleTarget = doc.head || doc.documentElement;
-        if (styleTarget) {
-          styleEl = doc.createElement("style");
-          styleEl.id = STYLE_ID;
-          styleEl.textContent = STYLES;
-          styleTarget.appendChild(styleEl);
-        }
-      } else {
-        // Don't remove a pre-existing style element we didn't create.
-        styleEl = null;
-      }
+      const styleEl = this.ensureSecondaryDocumentStyles(doc);
 
       this.bindDocumentEvents(doc, win, signal);
       win?.addEventListener?.("unload", () => this.cleanupDocument(doc), { once: true, signal });
 
       let observer = null;
       const ObserverCtor = win?.MutationObserver ?? (typeof MutationObserver === "function" ? MutationObserver : null);
-      const observeTarget = doc.body || doc.documentElement;
+      const observeTarget = doc.documentElement || doc.body;
       if (ObserverCtor && observeTarget) {
         observer = new ObserverCtor((mutations) => {
           if (!this.running) return;
+          // Immediately re-inject `<style>` if Discord's popout portal wiped `<head>`!
+          if (!doc.getElementById?.(STYLE_ID)) {
+            const tracked = this.#trackedDocs.get(doc);
+            if (tracked) tracked.styleEl = this.ensureSecondaryDocumentStyles(doc);
+          }
           if (!mutations?.length || mutations.some((m) => m?.addedNodes?.length || m?.removedNodes?.length)) {
             this.scheduleScan();
           }
@@ -1347,6 +1367,14 @@
       if (!this.running) return;
       if (mutation?.addedNodes?.length || mutation?.removedNodes?.length) {
         this.scheduleScan();
+      }
+      // Also catch videos moved via React portals into a Popout Window (where the
+      // mutation fires inside `popoutWindow.document`, not the main `document`!):
+      for (const [video, controller] of this.controllers) {
+        if (video.ownerDocument !== controller.doc) {
+          this.scheduleScan();
+          break;
+        }
       }
     }
 
@@ -1568,6 +1596,14 @@
       if (!this.running) return;
 
       const activeDocs = this.collectDocuments();
+      // Also discover any popout `ownerDocument` that Discord adopted an existing `<video>` into
+      // even if `PopoutWindowStore` has not registered or matched by key yet!
+      for (const video of this.controllers.keys()) {
+        const vDoc = video.ownerDocument;
+        if (vDoc && vDoc !== document && !vDoc.defaultView?.closed && !activeDocs.includes(vDoc)) {
+          activeDocs.push(vDoc);
+        }
+      }
       const activeDocSet = new Set(activeDocs);
 
       for (const doc of [...this.#trackedDocs.keys()]) {
@@ -1583,7 +1619,10 @@
       }
 
       for (const [video, controller] of this.controllers) {
-        if (!activeDocSet.has(controller.doc) || !video.isConnected || !this.isRetainedControllerValid(video, controller)) {
+        // Critical: if Discord moved `<video>` across documents (Main Window <-> Popout Window),
+        // tear down the old document's controller cleanly so a fresh controller mounts in `video.ownerDocument`!
+        const docChanged = video.ownerDocument !== controller.doc;
+        if (docChanged || !activeDocSet.has(controller.doc) || !video.isConnected || !this.isRetainedControllerValid(video, controller)) {
           controller.destroy();
           this.controllers.delete(video);
         } else {
@@ -1814,6 +1853,14 @@
       const savedRow = doc.createElement("div");
       savedRow.className = "dsc-saved-row";
       hud.appendChild(savedRow);
+
+      // Embed a local `<style>` inside `root` for secondary popout documents so
+      // Discord's WindowPortal stylesheet sync can NEVER wipe our CSS rules!
+      if (doc !== document) {
+        const localStyle = doc.createElement("style");
+        localStyle.textContent = STYLES;
+        root.appendChild(localStyle);
+      }
 
       root.append(trigger, hud);
 
@@ -2719,6 +2766,12 @@
       if (!rootEl || this.doc !== document || !this.manager.api.DOM.onRemoved) return;
 
       this.#offRemoved = this.manager.api.DOM.onRemoved(rootEl, () => {
+        // If Discord moved `<video>` into a Popout Window, `video.ownerDocument` changed—
+        // trigger a full scan instead of appending a main-document overlay into the popout!
+        if (this.video.ownerDocument !== this.doc) {
+          this.manager.scheduleScan();
+          return;
+        }
         if (this.video.isConnected && this.overlay.rootEl) {
           this.recheckHostContainer();
         }
